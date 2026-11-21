@@ -1,0 +1,5 @@
+telegram_config.json
+signals_log.csv
+backtest_trades.csv
+state/
+__pycache__/
