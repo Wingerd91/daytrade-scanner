@@ -1,0 +1,50 @@
+{
+  "gemaakt": "2026-11-21T19:23:41",
+  "stats": {
+    "aandeel|Breakdown low gisteren|short": {
+      "n": 36,
+      "winrate": 0.5555555555555556,
+      "avg_r": 0.7626876127747774
+    },
+    "aandeel|Breakout high gisteren|long": {
+      "n": 30,
+      "winrate": 0.26666666666666666,
+      "avg_r": -0.19127860567814872
+    },
+    "aandeel|ORB|long": {
+      "n": 29,
+      "winrate": 0.27586206896551724,
+      "avg_r": 0.3125779173405221
+    },
+    "aandeel|ORB|short": {
+      "n": 31,
+      "winrate": 0.16129032258064516,
+      "avg_r": 0.018077473250370388
+    },
+    "aandeel|VWAP-afwijzing|short": {
+      "n": 216,
+      "winrate": 0.3055555555555556,
+      "avg_r": 0.06072115002118835
+    },
+    "aandeel|VWAP-pullback|long": {
+      "n": 219,
+      "winrate": 0.3105022831050228,
+      "avg_r": 0.0477023310412585
+    },
+    "crypto|Breakout high gisteren|long": {
+      "n": 75,
+      "winrate": 0.3466666666666667,
+      "avg_r": 0.05236312433169374
+    },
+    "crypto|ORB|long": {
+      "n": 191,
+      "winrate": 0.43455497382198954,
+      "avg_r": 0.324660058617506
+    },
+    "crypto|VWAP-pullback|long": {
+      "n": 376,
+      "winrate": 0.3696808510638298,
+      "avg_r": 0.13085717522114892
+    }
+  }
+}
