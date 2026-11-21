@@ -614,10 +614,22 @@ def run_backtest(args, tickers: list[str], cfg: Config):
           f"Break-even bij een {cfg.min_rr:g}R-doel ligt rond {100/(1+cfg.min_rr):.0f}% winrate vóór kosten.")
     token, chat = telegram_creds()
     if token and chat:
-        lines = [f"{ICON[r['oordeel']]} {r['setup']}: {r['winrate']} win, {r['verw. R']}R (n={r['trades']})"
-                 for r in sorted(rows, key=lambda r: r["setup"])]
-        telegram_send(token, chat, f"📊 Backtest {DAY}-setups bijgewerkt (na kosten)\n" + "\n".join(lines)
-                      + "\n\nSwing-setups hebben geen backtest: hun uitstap (red zone) teken je zelf.")
+        lines = []
+        for markt, titel in (("aandeel", "📈 <b>Aandelen</b>"), ("crypto", "🪙 <b>Crypto</b>")):
+            sel = [(k, v) for k, v in sorted(stats.items()) if k.startswith(markt + "|")]
+            if sel:
+                lines.append(titel)
+            for k, v in sel:
+                _, setup, richting = k.split("|")
+                o = judge(v, cfg)
+                lines.append(f"{ICON[o]} {esc(setup)} ({richting}): {v['winrate']*100:.0f}% win, "
+                             f"<b>{v['avg_r']:+.2f}R</b> · {o} (n={v['n']})")
+        telegram_send(token, chat,
+                      "📊 <b>STATISTIEK – dit is GEEN signaal</b>\n"
+                      f"Slagingskans per {DAY}-setup, na kosten. Signalen met een ticker komen apart.\n"
+                      f"{LIJN}\n" + "\n".join(lines) + f"\n{LIJN}\n"
+                      "🟢 hoog ≥ +0,25R · 🟡 gemiddeld · 🔴 laag (verliesgevend) · ⚪ te weinig data\n"
+                      f"{SWING}-setups hebben geen statistiek: hun uitstap (red zone) teken je zelf.")
 
 
 # --------------------------------------------------------------------------- #
@@ -860,7 +872,7 @@ def discover_chat_id(token: str) -> str | None:
     chat = str(chats[-1])
     with open(CHAT_ID_FILE, "w") as fh:
         fh.write(chat)
-    telegram_send(token, chat, "✅ Daytrade-scanner gekoppeld. Nieuwe signalen komen hier binnen.")
+    telegram_send(token, chat, "✅ <b>Scanner gekoppeld.</b> Nieuwe signalen komen hier binnen.")
     return chat
 
 
@@ -879,7 +891,8 @@ def telegram_creds():
 def telegram_send(token: str | None, chat: str | None, text: str) -> bool:
     if not token or not chat:
         return False
-    data = urllib.parse.urlencode({"chat_id": chat, "text": text[:4000]}).encode()
+    data = urllib.parse.urlencode({"chat_id": chat, "text": text[:4000], "parse_mode": "HTML",
+                                   "disable_web_page_preview": "true"}).encode()
     try:
         urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=10)
         return True
@@ -901,67 +914,135 @@ def telegram_setup(token: str):
     chat = str(chats[-1])
     with open(TELEGRAM_FILE, "w") as fh:
         json.dump({"token": token, "chat_id": chat}, fh)
-    ok = telegram_send(token, chat, "✅ Daytrade-scanner gekoppeld. Nieuwe signalen komen hier binnen.")
+    ok = telegram_send(token, chat, "✅ <b>Scanner gekoppeld.</b> Nieuwe signalen komen hier binnen.")
     print(f"Opgeslagen in {TELEGRAM_FILE} (chat-id {chat}). Testbericht {'verstuurd' if ok else 'MISLUKT'}.")
 
 
+LIJN = "━━━━━━━━━━━━━━━━"
+SETUP_UITLEG = {
+    "ORB": "uitbraak uit de eerste 15 minuten van de dag",
+    "Breakout high gisteren": "koers breekt door de hoogste koers van gisteren",
+    "Breakdown low gisteren": "koers zakt door de laagste koers van gisteren",
+    "VWAP-pullback": "terugval naar de gemiddelde dagkoers (VWAP) die standhoudt",
+    "VWAP-afwijzing": "koers stuit op de gemiddelde dagkoers (VWAP) en draait omlaag",
+    "Boven EMA Ribbon (dag)": "dagslot voor het eerst boven alle 8 EMA's (20 t/m 55)",
+    "WaveTrend-omslag in oversold (week)": "WaveTrend draait omhoog vanuit oversold op de weekkaart",
+}
+
+
+def esc(x) -> str:
+    return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def cur(symbol: str, market: str) -> str:
+    if market == "crypto":
+        return {"EUR": "€", "USD": "$", "USDT": "$", "USDC": "$"}.get(symbol.split("/")[-1], "")
+    return "€" if symbol.upper().endswith(EU_SUFFIXES) else "$"
+
+
+def money(x, symbol: str, market: str) -> str:
+    return f"{cur(symbol, market)}{fmt_price(float(x))}"
+
+
+def pct(a, b) -> str:
+    return f"{(float(b) / float(a) - 1) * 100:+.1f}%".replace(".", ",")
+
+
+def chart_link(symbol: str, market: str) -> str:
+    if market == "crypto":
+        tv = "BITVAVO:" + symbol.replace("/", "")
+    elif symbol.upper().endswith(".AS"):
+        tv = "EURONEXT:" + symbol.split(".")[0]
+    else:
+        tv = symbol
+    return f'<a href="https://www.tradingview.com/chart/?symbol={urllib.parse.quote(tv)}">📈 Open grafiek op TradingView</a>'
+
+
+def kop(symbol: str, market: str, richting: str) -> str:
+    markt = "crypto" if market == "crypto" else "aandeel"
+    actie = "🟢 KOPEN (long)" if richting == "long" else "🔻 SHORTEN (short)"
+    return f"<b>{esc(symbol)}</b>  ·  {markt}\n{actie}"
+
+
 def msg_daytrade(s, paper_note: str) -> str:
-    pijl = "⬆️" if s["richting"] == "long" else "⬇️"
-    return (f"{DAY} – {DAY_UITLEG}\n"
-            f"{pijl} {s['symbool']} – {s['setup']} ({s['richting']})\n"
-            f"Prijs {fmt_price(s['prijs'])} | stop {fmt_price(s['stop'])} | doel 2R {fmt_price(s['doel_2R'])}\n"
-            f"Aantal {s['aantal']:g} (risico {fmt_price(s['risico'])})\n"
-            f"{ICON.get(s['oordeel'], '')} Slagingskans {s['slagingskans']} – {s['oordeel']} (na kosten)\n"
-            f"Kosten ≈ {s['kosten_R']:.2f}R | RVOL {s['rvol']:.1f}x | ATR {s['atr_pct']:.1f}%"
-            + (f"\n⚠️ {s['opmerking']}" if s["opmerking"] else "")
-            + f"\n📝 Papertrade: {paper_note}"
-            + "\nNiet gevuld vóór het eind van de dag? Dan vervalt hij.")
+    sym, m = s["symbool"], s["markt"]
+    o = s.get("oordeel", "te weinig data")
+    waarschuwing = ""
+    if o == "laag":
+        waarschuwing = "\n⛔ <b>Deze setup was verliesgevend in de backtest.</b> Alleen papertraden."
+    return (f"⚡ <b>DAYTRADE</b> · vandaag in én vandaag uit\n{LIJN}\n"
+            f"{kop(sym, m, s['richting'])}\n"
+            f"Setup: <b>{esc(s['setup'])}</b> – {SETUP_UITLEG.get(s['setup'], '')}\n{LIJN}\n"
+            f"💶 Instap: <b>{money(s['prijs'], sym, m)}</b>\n"
+            f"🛑 Stop: <b>{money(s['stop'], sym, m)}</b> ({pct(s['prijs'], s['stop'])})\n"
+            f"🎯 Doel: <b>{money(s['doel_2R'], sym, m)}</b> ({pct(s['prijs'], s['doel_2R'])})\n"
+            f"📦 Aantal: {s['aantal']:g} · inzet {money(s['positiewaarde'], sym, m)} · risico {money(s['risico'], sym, m)}\n"
+            f"{LIJN}\n"
+            f"{ICON.get(o, '')} Slagingskans: <b>{esc(s['slagingskans'])} · {o}</b> (na kosten)\n"
+            f"💸 Kosten ≈ {s['kosten_R']:.2f}R  ·  RVOL {s['rvol']:.1f}x"
+            + (f"\n⚠️ {esc(s['opmerking'])}" if s["opmerking"] else "")
+            + waarschuwing
+            + f"\n📝 Papertrade: {esc(paper_note)}\n"
+            f"⏰ Vandaag niet gevuld of nog open bij slot? Dan sluiten/vervallen.\n"
+            f"{chart_link(sym, m)}")
 
 
 def msg_paper_closed(t: dict) -> str:
     icon = {"winst": "✅", "verlies": "❌", "tijd": "⏱"}[t["status"]]
     uitleg = {"winst": "doel geraakt", "verlies": "stop geraakt", "tijd": "einde dag, gesloten op slotkoers"}[t["status"]]
-    return (f"{icon} {DAY} papertrade #{int(t['id'])} gesloten – {uitleg}\n"
-            f"{t['symbool']} – {t['setup']} ({t['richting']})\n"
-            f"In {fmt_price(t['prijs'])} → uit {fmt_price(float(t['uitstap']))} = {float(t['R']):+.2f}R na kosten")
+    sym, m = t["symbool"], t["markt"]
+    return (f"{icon} <b>PAPERTRADE #{int(t['id'])} GESLOTEN</b> · ⚡ daytrade\n{LIJN}\n"
+            f"<b>{esc(sym)}</b> · {esc(t['setup'])} · {t['richting']}\n"
+            f"{uitleg.capitalize()}\n"
+            f"In {money(t['prijs'], sym, m)} → uit {money(float(t['uitstap']), sym, m)}\n"
+            f"Resultaat: <b>{float(t['R']):+.2f}R</b> na kosten")
 
 
 def msg_swing(s: dict) -> str:
-    return (f"{SWING} – {SWING_UITLEG}\n"
-            f"⬆️ {s['symbool']} – {s['setup']}\n"
-            f"Slot {fmt_price(s['prijs'])} | stop {fmt_price(s['stop'])} ({s['stop_pct']:.1f}% lager)\n"
-            f"Stop = {s['stop_uitleg']}\n"
-            f"Aantal {s['aantal']:g} (risico {fmt_price(s['risico'])} = 1%)\n"
-            f"🎯 Doel = jouw red zone (Fib, zelf tekenen). Alleen nemen als die boven "
-            f"{fmt_price(s['min_red_zone'])} ligt (1:2).\n"
-            f"ℹ️ {s['relatie']}.\n"
-            f"⚠️ Eerst checken op je TradingView-chart. Geen automatische papertrade, geen slagingspercentage.")
+    sym, m = s["symbool"], s["markt"]
+    return (f"🟣 <b>SWING</b> · dagen tot maanden vasthouden\n"
+            f"<i>Dit is GEEN daytrade.</i>\n{LIJN}\n"
+            f"{kop(sym, m, 'long')}\n"
+            f"Setup: <b>{esc(s['setup'])}</b> – {SETUP_UITLEG.get(s['setup'], '')}\n{LIJN}\n"
+            f"💶 Slotkoers: <b>{money(s['prijs'], sym, m)}</b>\n"
+            f"🛑 Stop: <b>{money(s['stop'], sym, m)}</b> ({pct(s['prijs'], s['stop'])}) – {esc(s['stop_uitleg'])}\n"
+            f"🎯 Doel: <b>jouw red zone</b> (Fib, zelf tekenen)\n"
+            f"     ➜ alleen nemen als die boven <b>{money(s['min_red_zone'], sym, m)}</b> ligt (1:2)\n"
+            f"📦 Aantal: {s['aantal']:g} · inzet {money(s['positiewaarde'], sym, m)} · risico {money(s['risico'], sym, m)}\n"
+            f"{LIJN}\n"
+            f"ℹ️ {esc(s['relatie'])}.\n"
+            f"⚠️ Eerst checken op je chart. Geen papertrade, geen slagingskans.\n"
+            f"{chart_link(sym, m)}")
 
 
 def msg_summary(day_df: pd.DataFrame, paper: pd.DataFrame, swing_today: list[dict]) -> str:
     today = dt.datetime.now(AMS).date()
-    lines = [f"📋 Dagoverzicht {today:%d-%m-%Y}", "", f"{DAY} ({DAY_UITLEG})"]
+    lines = [f"📋 <b>DAGOVERZICHT {today:%d-%m-%Y}</b>", LIJN, "⚡ <b>Daytrade-signalen vandaag</b>"]
     if len(day_df):
         for _, s in day_df.iterrows():
-            lines.append(f"• {s['symbool']} {s['setup']} ({s['richting']}) – {s.get('oordeel', '')}")
+            o = s.get("oordeel", "")
+            act = "kopen" if s["richting"] == "long" else "shorten"
+            lines.append(f"{ICON.get(o, '•')} <b>{esc(s['symbool'])}</b> – {act} – {esc(s['setup'])}")
     else:
-        lines.append("• geen signalen vandaag")
+        lines.append("• geen")
     done = paper[paper["status"] != "open"]
     done = done[pd.to_datetime(done["sluit_tijd"], utc=True, errors="coerce").dt.tz_convert(AMS).dt.date == today]
-    lines += ["", "📝 Papertrades vandaag gesloten"]
+    lines += ["", "📝 <b>Papertrades vandaag gesloten</b>"]
     if len(done):
         for _, t in done.iterrows():
-            lines.append(f"• #{int(t['id'])} {t['symbool']} {t['setup']}: {float(t['R']):+.2f}R ({t['status']})")
-        lines.append(f"Totaal vandaag: {done['R'].astype(float).sum():+.2f}R")
+            icon = {"winst": "✅", "verlies": "❌", "tijd": "⏱"}.get(t["status"], "•")
+            lines.append(f"{icon} #{int(t['id'])} <b>{esc(t['symbool'])}</b> {esc(t['setup'])}: <b>{float(t['R']):+.2f}R</b>")
+        lines.append(f"Totaal vandaag: <b>{done['R'].astype(float).sum():+.2f}R</b>")
     else:
         lines.append("• geen")
     open_ = paper[paper["status"] == "open"]
-    lines += ["", f"📂 Nog open: {len(open_)}/3"] + [f"• #{int(t['id'])} {t['symbool']} {t['setup']}" for _, t in open_.iterrows()]
+    lines += ["", f"📂 <b>Papertrades nog open: {len(open_)}/3</b>"]
+    lines += [f"• #{int(t['id'])} <b>{esc(t['symbool'])}</b> {esc(t['setup'])}" for _, t in open_.iterrows()]
     prog = paper_progress(paper)
     if prog:
-        lines += ["", "📈 Op weg naar 30 papertrades per setup"] + [f"• {p}" for p in prog]
-    lines += ["", f"{SWING} ({SWING_UITLEG})"]
-    lines += [f"• {s['symbool']} – {s['setup']}" for s in swing_today] or ["• geen nieuwe swing-signalen"]
+        lines += ["", "📈 <b>Op weg naar 30 papertrades per setup</b>"] + [f"• {esc(p)}" for p in prog]
+    lines += ["", LIJN, "🟣 <b>Swing-signalen</b> (dagen tot maanden)"]
+    lines += [f"• <b>{esc(s['symbool'])}</b> – {esc(s['setup'])}" for s in swing_today] or ["• geen nieuwe"]
     return "\n".join(lines)
 
 
