@@ -505,12 +505,40 @@ def log_signals(df: pd.DataFrame, path: str) -> pd.DataFrame:
     return new
 
 
+CHAT_ID_FILE = os.path.join(STATE_DIR, "telegram_chat_id.txt")
+
+
+def discover_chat_id(token: str) -> str | None:
+    """Zoekt de chat-id zelf op via de laatste berichten aan de bot en onthoudt hem."""
+    if os.path.exists(CHAT_ID_FILE):
+        with open(CHAT_ID_FILE) as fh:
+            return fh.read().strip() or None
+    try:
+        with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getUpdates", timeout=10) as r:
+            updates = json.load(r).get("result", [])
+    except Exception as e:
+        print(f"  ! Telegram: kon chat-id niet ophalen ({e})", file=sys.stderr)
+        return None
+    chats = [u[k]["chat"]["id"] for u in updates for k in ("message", "my_chat_member") if k in u]
+    if not chats:
+        print("  ! Telegram: geen chat gevonden. Stuur je bot een bericht (bv. 'hoi').", file=sys.stderr)
+        return None
+    chat = str(chats[-1])
+    with open(CHAT_ID_FILE, "w") as fh:
+        fh.write(chat)
+    telegram_send(token, chat, "✅ Daytrade-scanner gekoppeld. Nieuwe signalen komen hier binnen.")
+    return chat
+
+
 def telegram_creds():
     token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if (not token or not chat) and os.path.exists(TELEGRAM_FILE):
         with open(TELEGRAM_FILE) as fh:
             c = json.load(fh)
         token, chat = token or c.get("token"), chat or c.get("chat_id")
+    token = (token or "").strip() or None
+    if token and not chat:
+        chat = discover_chat_id(token)
     return token, chat
 
 
