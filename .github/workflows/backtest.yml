@@ -1,0 +1,74 @@
+name: Backtest
+
+on:
+  schedule:
+    - cron: "17 5 * * 0"     # elke zondag rond 06:17 Nederlandse tijd
+  workflow_dispatch:         # handmatig starten via de knop "Run workflow"
+
+permissions:
+  contents: write            # om setup_stats.json terug te zetten in de repo
+
+concurrency:
+  group: scanner
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SCANNER_STATE_DIR: state
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Vorige status ophalen
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Backtest draaien
+        run: python daytrade_scanner.py --backtest ${{ vars.BACKTEST_ARGS }}
+
+      - name: Slagingspercentages opslaan in de repo
+        run: |
+          git config user.name "scanner-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add setup_stats.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Backtest bijwerken"
+            git push
+          fi
+
+      - name: Status bewaren
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Logboek en backtest-trades downloadbaar maken
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logboek-en-backtest
+          path: state/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Foutmelding naar Telegram
+        if: failure()
+        run: |
+          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=❌ Backtest mislukt: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
