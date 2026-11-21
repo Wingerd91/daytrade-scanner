@@ -47,6 +47,59 @@ jobs:
       - name: Foutmelding naar Telegram
         if: failure()
         run: |
+          CHAT="${TELEGRAM_CHAT_ID:-$(cat state/telegram_chat_id.txt 2>/dev/null)}"
+          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT}" \
+            --data-urlencode "text=❌ Scanner-run mislukt: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+name: Scan
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # elke 5 minuten (GitHub kan een paar minuten uitlopen)
+  workflow_dispatch:         # handmatig starten via de knop "Run workflow"
+
+concurrency:
+  group: scanner             # nooit twee runs tegelijk (scan en backtest delen hun status)
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SCANNER_STATE_DIR: state
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Vorige status ophalen (logboek, zodat signalen niet dubbel komen)
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Scannen
+        run: python daytrade_scanner.py ${{ vars.SCAN_ARGS }}
+
+      - name: Status bewaren
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Foutmelding naar Telegram
+        if: failure()
+        run: |
           curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=❌ Scanner-run mislukt: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
