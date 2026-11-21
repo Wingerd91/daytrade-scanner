@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-Daytrade-scanner voor aandelen (Yahoo Finance) en crypto (Bitvavo via ccxt).
+Trade-scanner voor aandelen (Yahoo Finance) en crypto (Bitvavo via ccxt).
 
-Scant een watchlist op intraday setups (ORB, breakout door high/low van gisteren,
-VWAP-pullback), filtert op volatiliteit en relatief volume, en rekent per kans
-stop, doel en positiegrootte uit volgens vaste risicoregels:
-  - max 1% van het account riskeren per trade
-  - stop op het invalidatiepunt van de setup
-  - minimaal 1:2 reward:risk tot het eerstvolgende level
-  - max 3 open posities
+Twee soorten signalen, strikt gescheiden:
 
-Met --backtest speelt hij elke setup na op de afgelopen weken en slaat per setup
-het slagingspercentage op. Elke scan toont dat percentage daarna bij elk signaal.
+  ⚡ DAYTRADE  openen én sluiten op dezelfde dag. Vaste stop en vast 2R-doel.
+              Setups: ORB, breakout/breakdown high/low van gisteren, VWAP-pullback/-afwijzing.
+              Wordt automatisch gepapertraded (max 3 tegelijk open).
+  🟣 SWING     dagen tot maanden vasthouden. Uitstap op je eigen red zone (Fib, zelf tekenen).
+              Setups: koers boven de EMA Ribbon (dag), WaveTrend-omslag in oversold (week).
+              Eén keer per dag gescand. Géén automatische papertrade.
 
+Vaste risicoregels: max 1% risico per trade, stop op invalidatie, minimaal 1:2, max 3 posities.
 Dit is een scanner, geen handelsbot: hij plaatst geen orders. Geen financieel advies.
 
 Voorbeelden:
-  python daytrade_scanner.py --backtest                 # eerst: slagingspercentages berekenen
-  python daytrade_scanner.py                            # aandelen + crypto, één keer
+  python daytrade_scanner.py --backtest          # slagingspercentages daytrade-setups (na kosten)
+  python daytrade_scanner.py                     # één scan (+ swing en dagoverzicht na 22:15)
   python daytrade_scanner.py --market crypto --loop 5
-  python daytrade_scanner.py --telegram-setup <TOKEN>   # Telegram koppelen
+  python daytrade_scanner.py --swing-now         # swing-scan + dagoverzicht direct uitvoeren
 """
 from __future__ import annotations
 
@@ -34,32 +33,25 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-
-from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = os.getenv("SCANNER_STATE_DIR", HERE)        # op de server: aparte map die bewaard blijft
 STATS_FILE = os.path.join(HERE, "setup_stats.json")     # naast het script (wordt op GitHub gecommit)
 TELEGRAM_FILE = os.path.join(HERE, "telegram_config.json")
-EU_SUFFIXES = (".AS", ".DE", ".PA", ".BR", ".MI", ".MC", ".L", ".SW", ".CO", ".ST", ".HE", ".OL", ".LS")
-SESSIONS = {"us": ("America/New_York", (9, 30), (16, 0)), "eu": ("Europe/Amsterdam", (9, 0), (17, 30))}
+PAPER_FILE = os.path.join(STATE_DIR, "paper_trades.csv")
+SWING_LOG = os.path.join(STATE_DIR, "swing_log.csv")
+DAY_STATE = os.path.join(STATE_DIR, "dag_status.json")
+CHAT_ID_FILE = os.path.join(STATE_DIR, "telegram_chat_id.txt")
+AMS = ZoneInfo("Europe/Amsterdam")
 
-
-def market_open(ticker: str, now: dt.datetime | None = None) -> bool:
-    """Grove check op beurstijden (feestdagen niet meegenomen; oude data wordt later alsnog weggefilterd)."""
-    tz, (oh, om), (ch, cm) = SESSIONS["eu" if ticker.upper().endswith(EU_SUFFIXES) else "us"]
-    local = (now or dt.datetime.now(dt.timezone.utc)).astimezone(ZoneInfo(tz))
-    if local.weekday() >= 5:
-        return False
-    minutes = local.hour * 60 + local.minute
-    return oh * 60 + om <= minutes <= ch * 60 + cm + 5
-
-# --------------------------------------------------------------------------- #
-# Instellingen
-# --------------------------------------------------------------------------- #
+DAY = "⚡ DAYTRADE"
+SWING = "🟣 SWING"
+DAY_UITLEG = "vandaag openen én vandaag sluiten"
+SWING_UITLEG = "dagen tot maanden vasthouden – GEEN daytrade"
 
 DEFAULT_STOCKS = [
     # US: liquide namen en ETF's die veel intraday bewegen
@@ -70,7 +62,12 @@ DEFAULT_STOCKS = [
     "ASML.AS", "ADYEN.AS", "BESI.AS", "INGA.AS", "PRX.AS", "ASM.AS",
 ]
 STABLECOINS = {"USDT", "USDC", "EURC", "DAI", "EURT", "TUSD", "FDUSD", "PYUSD", "EURS"}
+EU_SUFFIXES = (".AS", ".DE", ".PA", ".BR", ".MI", ".MC", ".L", ".SW", ".CO", ".ST", ".HE", ".OL", ".LS")
+SESSIONS = {"us": ("America/New_York", (9, 30), (16, 0)), "eu": ("Europe/Amsterdam", (9, 0), (17, 30))}
 JUDGE_RANK = {"te weinig data": 0, "laag": 1, "gemiddeld": 2, "hoog": 3}
+ICON = {"hoog": "🟢", "gemiddeld": "🟡", "laag": "🔴", "te weinig data": "⚪"}
+PAPER_COLS = ["id", "markt", "symbool", "setup", "richting", "open_tijd", "prijs", "stop", "doel",
+              "fee", "oordeel", "status", "sluit_tijd", "uitstap", "R"]
 
 
 @dataclass
@@ -89,6 +86,29 @@ class Config:
     shorts_stocks: bool = True
     shorts_crypto: bool = False    # spot crypto kun je niet shorten
     min_trades_for_judgement: int = 20
+    fee_stocks: float = 0.0005     # kosten per kant (aan- of verkoop), 0,05%: spread + commissie
+    fee_crypto: float = 0.0025     # Bitvavo taker-fee per kant, 0,25%
+    regime_drop_crypto: float = 1.0  # BTC "hard dalend": onder VWAP, EMA9<EMA20 én ≥1% gedaald vandaag
+    regime_drop_index: float = 0.5   # SPY/AEX idem bij ≥0,5%
+    summary_time: tuple = (22, 15)   # dagoverzicht + swing-scan (Nederlandse tijd)
+    wt_oversold: float = -53.0       # VuManChu B standaard oversold-niveau
+
+    def fee(self, market: str) -> float:
+        return self.fee_crypto if market == "crypto" else self.fee_stocks
+
+
+def now_utc() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
+
+
+def market_open(ticker: str, now: dt.datetime | None = None) -> bool:
+    """Grove check op beurstijden (feestdagen niet meegenomen; oude data wordt later alsnog weggefilterd)."""
+    tz, (oh, om), (ch, cm) = SESSIONS["eu" if ticker.upper().endswith(EU_SUFFIXES) else "us"]
+    local = (now or dt.datetime.now(dt.timezone.utc)).astimezone(ZoneInfo(tz))
+    if local.weekday() >= 5:
+        return False
+    minutes = local.hour * 60 + local.minute
+    return oh * 60 + om <= minutes <= ch * 60 + cm + 5
 
 
 # --------------------------------------------------------------------------- #
@@ -113,11 +133,33 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return tr.ewm(alpha=1 / n, adjust=False).mean()
 
 
+def wavetrend(df: pd.DataFrame, channel: int = 9, average: int = 12, ma: int = 3):
+    """WaveTrend zoals in VuManChu Cipher B (standaardinstellingen 9/12/3)."""
+    ap = (df["high"] + df["low"] + df["close"]) / 3
+    esa = ema(ap, channel)
+    d = ema((ap - esa).abs(), channel)
+    ci = (ap - esa) / (0.015 * d.replace(0, np.nan))
+    wt1 = ema(ci.fillna(0), average)
+    return wt1, wt1.rolling(ma).mean()
+
+
+def closed_only(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Haalt de laatste candle weg als die nog niet afgesloten is (anders 'verdwijnen' signalen weer)."""
+    if df.empty:
+        return df
+    end = df.index[-1] + pd.Timedelta(minutes=minutes)
+    return df.iloc[:-1] if end > now_utc() else df
+
+
+def _dates(idx) -> np.ndarray:
+    return np.array(idx.date, dtype="datetime64[D]")
+
+
 def build_features(intra: pd.DataFrame, daily: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Berekent per 5m-candle alles wat de regels nodig hebben, met alleen data tot en met die candle.
     Zo gebruiken de live scan (laatste candle) en de backtest (elke candle) exact dezelfde logica."""
     f = intra.copy()
-    f["d"] = np.array(f.index.date, dtype="datetime64[D]")
+    f["d"] = _dates(f.index)
     f["i"] = np.arange(len(f))
     tp = (f["high"] + f["low"] + f["close"]) / 3
     f["_pv"] = tp * f["volume"]
@@ -143,7 +185,7 @@ def build_features(intra: pd.DataFrame, daily: pd.DataFrame, cfg: Config) -> pd.
     dd["datr"] = atr(dd)
     dd["hi5"], dd["lo5"] = dd["high"].rolling(5).max(), dd["low"].rolling(5).min()
     dd.loc[np.arange(len(dd)) < 14, "datr"] = np.nan        # te weinig dagen voor ATR
-    ddates = np.array(dd.index.date, dtype="datetime64[D]")
+    ddates = _dates(dd.index)
     sess = np.unique(f["d"].to_numpy())
     pos = np.searchsorted(ddates, sess, side="left") - 1
     lv = {}
@@ -156,8 +198,34 @@ def build_features(intra: pd.DataFrame, daily: pd.DataFrame, cfg: Config) -> pd.
     return f.drop(columns="_pv")
 
 
+def regime_series(intra: pd.DataFrame, drop_pct: float) -> pd.Series:
+    """Marktrichting per candle: -1 = hard dalend, +1 = hard stijgend, 0 = neutraal.
+    Hard dalend = onder VWAP, EMA9 < EMA20 en minstens drop_pct% lager dan de opening van de dag."""
+    if intra is None or intra.empty:
+        return pd.Series(dtype=float)
+    f = intra.copy()
+    f["d"] = _dates(f.index)
+    tp = (f["high"] + f["low"] + f["close"]) / 3
+    f["_pv"] = tp * f["volume"]
+    g = f.groupby("d", sort=False)
+    vw = (g["_pv"].cumsum() / g["volume"].cumsum().replace(0, np.nan)).fillna(tp)
+    e9, e20 = ema(f["close"], 9), ema(f["close"], 20)
+    chg = (f["close"] / g["open"].transform("first") - 1) * 100
+    s = pd.Series(0.0, index=f.index)
+    s[(f["close"] < vw) & (e9 < e20) & (chg <= -drop_pct)] = -1.0
+    s[(f["close"] > vw) & (e9 > e20) & (chg >= drop_pct)] = 1.0
+    s.index = s.index.tz_convert("UTC")
+    return s[~s.index.duplicated()].sort_index()
+
+
+def align_regime(reg: pd.Series | None, index: pd.DatetimeIndex) -> np.ndarray:
+    if reg is None or reg.empty:
+        return np.zeros(len(index))
+    return reg.reindex(index.tz_convert("UTC"), method="ffill").fillna(0).to_numpy()
+
+
 # --------------------------------------------------------------------------- #
-# Regels
+# Daytrade-regels
 # --------------------------------------------------------------------------- #
 
 def size_position(entry: float, stop: float, cfg: Config, fractional: bool):
@@ -172,8 +240,8 @@ def size_position(entry: float, stop: float, cfg: Config, fractional: bool):
     return qty, qty * entry, qty * per_unit, note
 
 
-def rules(row: dict, cfg: Config, market: str) -> list[dict]:
-    """Past de setups toe op één candle (row uit build_features)."""
+def rules(row: dict, cfg: Config, market: str, regime: float = 0.0) -> list[dict]:
+    """Past de daytrade-setups toe op één afgesloten candle (row uit build_features)."""
     if row["i"] < 30 or row["k"] < cfg.or_bars + 1:
         return []
     if any(pd.isna(row[x]) for x in ("pdh", "datr", "rvol", "orh", "atr5")):
@@ -188,8 +256,8 @@ def rules(row: dict, cfg: Config, market: str) -> list[dict]:
     pdh, pdl, e9, e20 = row["pdh"], row["pdl"], row["e9"], row["e20"]
     ext = cfg.max_extension_atr * atr5
     allow_short = cfg.shorts_crypto if market == "crypto" else cfg.shorts_stocks
-    up = price > vw and e9 > e20
-    down = price < vw and e9 < e20
+    up = price > vw and e9 > e20 and regime > -1      # geen longs als de markt hard daalt
+    down = price < vw and e9 < e20 and regime < 1     # geen shorts als de markt hard stijgt
     cands = []  # (setup, richting, stop)
 
     if up and r <= cfg.rsi_max:
@@ -209,6 +277,7 @@ def rules(row: dict, cfg: Config, market: str) -> list[dict]:
             cands.append(("VWAP-afwijzing", "short", max(row["high"], vw) + 0.25 * atr5))
 
     out = []
+    fee = cfg.fee(market)
     for setup, side, stop in cands:
         entry = price
         risk = entry - stop if side == "long" else stop - entry
@@ -225,47 +294,68 @@ def rules(row: dict, cfg: Config, market: str) -> list[dict]:
         rr_level = abs(level - entry) / risk if level is not None else None
         rr_ok = rr_level is None or rr_level >= cfg.min_rr
         qty, value, risk_eur, size_note = size_position(entry, stop, cfg, fractional=(market == "crypto"))
+        kosten_r = fee * (entry + target) / risk     # kosten heen en terug, uitgedrukt in R
         notes = [n for n in (size_note,
                              "geen level in de weg (nieuwe high/low)" if level is None else "",
                              f"R:R tot level < {cfg.min_rr:g}" if not rr_ok else "") if n]
-        score = min(rvol, 5) * 2 + min(atr_pct, 8) + (min(rr_level, 5) if rr_level is not None else 3)
+        score = min(rvol, 5) * 2 + min(atr_pct, 8) + (min(rr_level, 5) if rr_level is not None else 3) - kosten_r * 3
         out.append({
-            "markt": market, "setup": setup, "richting": side,
+            "type": "daytrade", "markt": market, "setup": setup, "richting": side,
             "prijs": entry, "stop": stop, "doel_2R": target, "volgend_level": level,
             "rr_tot_level": rr_level, "rr_ok": rr_ok, "rvol": rvol, "atr_pct": atr_pct,
             "gap_pct": row["gap_pct"] if market != "crypto" else float("nan"),
             "rsi_5m": r, "vwap": vw, "aantal": qty, "positiewaarde": value,
-            "risico": risk_eur, "score": score, "opmerking": "; ".join(notes),
+            "risico": risk_eur, "kosten_R": kosten_r, "score": score, "opmerking": "; ".join(notes),
         })
     return out
 
 
-def analyze(symbol: str, market: str, intra: pd.DataFrame, daily: pd.DataFrame, cfg: Config) -> list[dict]:
+def analyze(symbol: str, market: str, intra: pd.DataFrame, daily: pd.DataFrame, cfg: Config,
+            regime: float = 0.0) -> list[dict]:
     f = build_features(intra, daily, cfg)
-    sigs = rules(f.iloc[-1].to_dict(), cfg, market)
+    sigs = rules(f.iloc[-1].to_dict(), cfg, market, regime)
     for s in sigs:
-        s["symbool"], s["data_tijd"] = symbol, str(f.index[-1])
+        s["symbool"], s["data_tijd"] = symbol, f.index[-1].tz_convert("UTC").isoformat()
     return sigs
+
+
+def simulate(H, L, C, start: int, end: int, entry: float, stop: float, target: float, long: bool):
+    """Loopt candles start..end af. Stop en doel in dezelfde candle telt als verlies (voorzichtig).
+    Geeft (resultaat, uitstapprijs, index) of None als nog niets geraakt is."""
+    for j in range(start, end + 1):
+        if (L[j] <= stop) if long else (H[j] >= stop):
+            return "verlies", stop, j
+        if (H[j] >= target) if long else (L[j] <= target):
+            return "winst", target, j
+    return None
+
+
+def net_r(entry: float, exit_: float, stop: float, long: bool, fee: float) -> float:
+    risk = abs(entry - stop)
+    gross = (exit_ - entry) if long else (entry - exit_)
+    return (gross - fee * (entry + exit_)) / risk
 
 
 # --------------------------------------------------------------------------- #
 # Backtest en slagingspercentage
 # --------------------------------------------------------------------------- #
 
-def backtest_symbol(symbol: str, market: str, intra: pd.DataFrame, daily: pd.DataFrame, cfg: Config) -> list[dict]:
-    """Speelt elke setup na: instap op de slotkoers van de signaalcandle, daarna wint hij als
-    het 2R-doel eerder geraakt wordt dan de stop. Raakt een candle beide, dan telt het als verlies
-    (voorzichtig). Niets geraakt aan het eind van de sessie: uitstap op de slotkoers.
+def backtest_symbol(symbol: str, market: str, intra: pd.DataFrame, daily: pd.DataFrame, cfg: Config,
+                    regime: pd.Series | None = None) -> list[dict]:
+    """Speelt elke daytrade-setup na: instap op de slotkoers van de signaalcandle, winst als het 2R-doel
+    eerder geraakt wordt dan de stop, anders uitstap aan het eind van de dag. Kosten worden afgetrokken.
     Per symbool/dag/setup/richting telt alleen het eerste signaal."""
     f = build_features(intra, daily, cfg)
+    regs = align_regime(regime, f.index)
     last_day = f["d"].iloc[-1]
     H, L, C = f["high"].to_numpy(), f["low"].to_numpy(), f["close"].to_numpy()
     end = (f["i"] + f.groupby("d").cumcount(ascending=False)).to_numpy()  # laatste candle van de sessie
+    fee = cfg.fee(market)
     seen, trades = set(), []
-    for row in f.to_dict("records"):
+    for n, row in enumerate(f.to_dict("records")):
         if row["d"] == last_day:      # lopende sessie overslaan: uitkomst nog onbekend
             break
-        for s in rules(row, cfg, market):
+        for s in rules(row, cfg, market, regs[n]):
             key = (row["d"], s["setup"], s["richting"])
             if not s["rr_ok"] or key in seen:
                 continue
@@ -273,23 +363,12 @@ def backtest_symbol(symbol: str, market: str, intra: pd.DataFrame, daily: pd.Dat
             i, e = row["i"], end[row["i"]]
             if i >= e:
                 continue
-            entry, stop, target = s["prijs"], s["stop"], s["doel_2R"]
-            risk = abs(entry - stop)
             long = s["richting"] == "long"
-            result, r_mult = "tijd", None
-            for j in range(i + 1, e + 1):
-                hit_stop = L[j] <= stop if long else H[j] >= stop
-                hit_tgt = H[j] >= target if long else L[j] <= target
-                if hit_stop:
-                    result, r_mult = "verlies", -1.0
-                    break
-                if hit_tgt:
-                    result, r_mult = "winst", cfg.min_rr
-                    break
-            if r_mult is None:
-                r_mult = ((C[e] - entry) if long else (entry - C[e])) / risk
+            hit = simulate(H, L, C, i + 1, e, s["prijs"], s["stop"], s["doel_2R"], long)
+            result, exit_ = (hit[0], hit[1]) if hit else ("tijd", C[e])
             trades.append({"markt": market, "symbool": symbol, "setup": s["setup"], "richting": s["richting"],
-                           "datum": str(row["d"]), "resultaat": result, "R": r_mult})
+                           "datum": str(row["d"]), "resultaat": result,
+                           "R": net_r(s["prijs"], exit_, s["stop"], long, fee)})
     return trades
 
 
@@ -302,8 +381,7 @@ def summarize(trades: pd.DataFrame) -> dict:
 
 
 def judge(st: dict | None, cfg: Config) -> str:
-    """Oordeel op basis van de verwachte R per trade (winrate alleen zegt weinig bij een 2R-doel:
-    vanaf ~33% winst speel je al quitte)."""
+    """Oordeel op basis van de verwachte R per trade na kosten (winrate alleen zegt weinig bij een 2R-doel)."""
     if not st or st["n"] < cfg.min_trades_for_judgement:
         return "te weinig data"
     if st["avg_r"] <= 0:
@@ -319,6 +397,8 @@ def load_stats() -> dict:
     age = (dt.date.today() - dt.date.fromisoformat(data["gemaakt"][:10])).days
     if age > 14:
         print(f"Let op: slagingspercentages zijn {age} dagen oud. Draai --backtest opnieuw.")
+    if not data.get("na_kosten"):
+        print("Let op: slagingspercentages zijn nog zonder kosten berekend. Draai --backtest opnieuw.")
     return data.get("stats", {})
 
 
@@ -342,11 +422,14 @@ def _norm(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=["open", "high", "low", "close"])
 
 
-def stock_data(t: str, intraday_period: str, daily_period: str):
+def stock_intraday(t: str, period: str = "5d") -> pd.DataFrame:
     import yfinance as yf
-    tk = yf.Ticker(t)
-    return (_norm(tk.history(period=intraday_period, interval="5m", prepost=False)),
-            _norm(tk.history(period=daily_period, interval="1d")))
+    return closed_only(_norm(yf.Ticker(t).history(period=period, interval="5m", prepost=False)), 5)
+
+
+def stock_daily(t: str, period: str) -> pd.DataFrame:
+    import yfinance as yf
+    return _norm(yf.Ticker(t).history(period=period, interval="1d"))
 
 
 def _ohlcv_df(rows) -> pd.DataFrame:
@@ -362,17 +445,21 @@ def crypto_exchange(exchange_id: str):
     return ex
 
 
-def crypto_symbols(ex, quote: str, top_n: int, symbols: str | None) -> list[str]:
+def crypto_symbols(ex, quote: str, top_n: int, symbols: str | None, movers: int = 10) -> list[str]:
+    """Top N op volume, plus de grootste stijgers/dalers van vandaag met genoeg volume."""
     if symbols:
         return [s.strip() for s in symbols.split(",")]
     tickers = ex.fetch_tickers()
-    pairs = [(s, tk.get("quoteVolume") or 0) for s, tk in tickers.items()
-             if s.endswith("/" + quote) and s.split("/")[0] not in STABLECOINS]
-    return [s for s, _ in sorted(pairs, key=lambda x: x[1], reverse=True)[:top_n]]
+    rows = [(s, tk.get("quoteVolume") or 0, tk.get("percentage") or 0) for s, tk in tickers.items()
+            if s.endswith("/" + quote) and s.split("/")[0] not in STABLECOINS]
+    by_vol = [s for s, _, _ in sorted(rows, key=lambda x: x[1], reverse=True)[:top_n]]
+    liquid = [r for r in rows if r[1] >= 250_000 and r[0] not in by_vol]
+    by_move = [s for s, _, _ in sorted(liquid, key=lambda x: abs(x[2]), reverse=True)[:movers]]
+    return by_vol + by_move
 
 
-def crypto_data(ex, sym: str, days: int):
-    since = ex.milliseconds() - days * 24 * 3600 * 1000
+def crypto_intraday(ex, sym: str, days: float) -> pd.DataFrame:
+    since = ex.milliseconds() - int(days * 24 * 3600 * 1000)
     rows = []
     for _ in range(100):  # pagineren
         batch = ex.fetch_ohlcv(sym, "5m", since=since, limit=1000)
@@ -382,7 +469,11 @@ def crypto_data(ex, sym: str, days: int):
         if batch[-1][0] >= ex.milliseconds() - 10 * 60 * 1000 or batch[-1][0] + 1 <= since:
             break
         since = batch[-1][0] + 1
-    return _ohlcv_df(rows), _ohlcv_df(ex.fetch_ohlcv(sym, "1d", limit=max(60, days + 30)))
+    return closed_only(_ohlcv_df(rows), 5)
+
+
+def crypto_daily(ex, sym: str, limit: int) -> pd.DataFrame:
+    return _ohlcv_df(ex.fetch_ohlcv(sym, "1d", limit=limit))
 
 
 def _parallel(fn, items, workers=8):
@@ -396,15 +487,77 @@ def _parallel(fn, items, workers=8):
         return [r for res in pool.map(safe, items) for r in res]
 
 
-def scan_stocks(tickers: list[str], cfg: Config, include_closed: bool) -> list[dict]:
+def benchmark_for(t: str) -> str:
+    return "^AEX" if t.upper().endswith(EU_SUFFIXES) else "SPY"
+
+
+def stock_regimes(cfg: Config, period: str = "5d") -> dict[str, pd.Series]:
+    out = {}
+    for b in ("SPY", "^AEX"):
+        try:
+            out[b] = regime_series(stock_intraday(b, period), cfg.regime_drop_index)
+        except Exception as e:
+            print(f"  ! marktfilter {b}: {e}", file=sys.stderr)
+            out[b] = pd.Series(dtype=float)
+    return out
+
+
+def last_regime(reg: pd.Series | None) -> float:
+    return float(reg.iloc[-1]) if reg is not None and len(reg) else 0.0
+
+
+def dynamic_stocks(state: dict) -> list[str]:
+    """Actieve US-aandelen van vandaag (grootste stijgers/dalers en meest verhandeld), elk half uur ververst."""
+    cache = state.get("dyn")
+    if cache and (now_utc() - pd.Timestamp(cache["t"])) < pd.Timedelta(minutes=30):
+        return cache["tickers"]
+    syms = []
+    try:
+        import yfinance as yf
+        for q in ("day_gainers", "day_losers", "most_actives"):
+            res = yf.screen(q, count=25)
+            for qd in (res.get("quotes", []) if isinstance(res, dict) else []):
+                price = qd.get("regularMarketPrice") or 0
+                vol = qd.get("averageDailyVolume3Month") or qd.get("regularMarketVolume") or 0
+                if qd.get("symbol") and price >= 5 and vol >= 1_000_000:
+                    syms.append(qd["symbol"])
+    except Exception as e:
+        print(f"  ! dynamische watchlist: {e}", file=sys.stderr)
+    syms = list(dict.fromkeys(syms))
+    state["dyn"] = {"t": now_utc().isoformat(), "tickers": syms}
+    return syms
+
+
+def earnings_soon(t: str, state: dict) -> bool:
+    """True als het bedrijf vandaag of de volgende handelsdag cijfers publiceert (per dag gecachet)."""
+    today = dt.date.today()
+    cache = state.setdefault("cijfers", {})
+    if cache.get("_datum") != today.isoformat():
+        cache.clear()
+        cache["_datum"] = today.isoformat()
+    if t in cache:
+        return cache[t]
+    soon = False
+    try:
+        import yfinance as yf
+        df = yf.Ticker(t).get_earnings_dates(limit=12)
+        horizon = today + dt.timedelta(days=3 if today.weekday() == 4 else 1)
+        soon = any(today <= ts.date() <= horizon for ts in (df.index if df is not None else []))
+    except Exception as e:
+        print(f"  ! cijfersdatum {t}: {e}", file=sys.stderr)
+    cache[t] = bool(soon)
+    return bool(soon)
+
+
+def scan_stocks(tickers: list[str], cfg: Config, include_closed: bool, regimes: dict) -> list[dict]:
     def one(t):
-        intra, daily = stock_data(t, "5d", "3mo")
+        intra, daily = stock_intraday(t), stock_daily(t, "3mo")
         if intra.empty or daily.empty:
             return []
-        stale = dt.datetime.now(dt.timezone.utc) - intra.index[-1].tz_convert("UTC") > dt.timedelta(minutes=30)
+        stale = now_utc() - intra.index[-1].tz_convert("UTC") > pd.Timedelta(minutes=30)
         if stale and not include_closed:
             return []
-        sigs = analyze(t, "aandeel", intra, daily, cfg)
+        sigs = analyze(t, "aandeel", intra, daily, cfg, last_regime(regimes.get(benchmark_for(t))))
         for s in sigs:
             if stale:
                 s["opmerking"] = "; ".join(x for x in (s["opmerking"], "MARKT DICHT – oude data") if x)
@@ -412,12 +565,21 @@ def scan_stocks(tickers: list[str], cfg: Config, include_closed: bool) -> list[d
     return _parallel(one, tickers, workers=4)  # rustig aan i.v.m. rate limits van Yahoo
 
 
-def scan_crypto(cfg: Config, args) -> list[dict]:
-    ex = crypto_exchange(args.exchange)
+def scan_crypto(cfg: Config, args, ex=None) -> list[dict]:
+    ex = ex or crypto_exchange(args.exchange)
     syms = crypto_symbols(ex, args.quote, args.crypto_top, args.crypto_symbols)
+    btc = f"BTC/{args.quote}"
+    try:
+        reg = last_regime(regime_series(crypto_intraday(ex, btc, 1.2), cfg.regime_drop_crypto))
+    except Exception as e:
+        print(f"  ! marktfilter {btc}: {e}", file=sys.stderr)
+        reg = 0.0
+    if reg < 0:
+        print(f"Marktfilter: {btc} daalt hard, geen crypto-longs.")
+
     def one(sym):
-        intra, daily = crypto_data(ex, sym, 3)
-        return analyze(sym, "crypto", intra, daily, cfg) if len(intra) and len(daily) else []
+        intra, daily = crypto_intraday(ex, sym, 3), crypto_daily(ex, sym, 60)
+        return analyze(sym, "crypto", intra, daily, cfg, reg) if len(intra) and len(daily) else []
     return _parallel(one, syms, workers=1)  # sequentieel i.v.m. rate limits
 
 
@@ -425,13 +587,16 @@ def run_backtest(args, tickers: list[str], cfg: Config):
     trades = []
     if args.market in ("stocks", "all"):
         print(f"Backtest aandelen ({len(tickers)}, laatste ~60 dagen; dat is het maximum voor 5m-data bij Yahoo)...")
-        trades += _parallel(lambda t: backtest_symbol(t, "aandeel", *stock_data(t, "60d", "1y"), cfg), tickers,
-                            workers=4)
+        regs = stock_regimes(cfg, "60d")
+        trades += _parallel(lambda t: backtest_symbol(t, "aandeel", stock_intraday(t, "60d"), stock_daily(t, "1y"),
+                                                      cfg, regs.get(benchmark_for(t))), tickers, workers=4)
     if args.market in ("crypto", "all"):
         ex = crypto_exchange(args.exchange)
-        syms = crypto_symbols(ex, args.quote, args.crypto_top, args.crypto_symbols)
+        syms = crypto_symbols(ex, args.quote, args.crypto_top, args.crypto_symbols, movers=0)
         print(f"Backtest crypto ({len(syms)} paren, laatste {args.bt_days} dagen)...")
-        trades += _parallel(lambda s: backtest_symbol(s, "crypto", *crypto_data(ex, s, args.bt_days), cfg),
+        btc_reg = regime_series(crypto_intraday(ex, f"BTC/{args.quote}", args.bt_days), cfg.regime_drop_crypto)
+        trades += _parallel(lambda s: backtest_symbol(s, "crypto", crypto_intraday(ex, s, args.bt_days),
+                                                      crypto_daily(ex, s, args.bt_days + 60), cfg, btc_reg),
                             syms, workers=1)
     if not trades:
         print("Geen trades gevonden in de backtest.")
@@ -440,20 +605,191 @@ def run_backtest(args, tickers: list[str], cfg: Config):
     tdf.to_csv(os.path.join(STATE_DIR, "backtest_trades.csv"), index=False)
     stats = summarize(tdf)
     with open(STATS_FILE, "w") as fh:
-        json.dump({"gemaakt": dt.datetime.now().isoformat(timespec="seconds"), "stats": stats}, fh, indent=2)
+        json.dump({"gemaakt": dt.datetime.now().isoformat(timespec="seconds"), "na_kosten": True,
+                   "kosten_per_kant": {"aandeel": cfg.fee_stocks, "crypto": cfg.fee_crypto}, "stats": stats}, fh, indent=2)
     rows = [{"setup": k.replace("|", " / "), "trades": v["n"], "winrate": f"{v['winrate']*100:.0f}%",
              "verw. R": f"{v['avg_r']:+.2f}", "oordeel": judge(v, cfg)} for k, v in stats.items()]
     print(pd.DataFrame(rows).sort_values("setup").to_string(index=False))
-    print(f"\nBreak-even bij een {cfg.min_rr:g}R-doel ligt rond {100/(1+cfg.min_rr):.0f}% winrate. "
-          "Kosten en slippage zitten er niet in.")
-    print(f"Opgeslagen in {STATS_FILE}; alle trades in backtest_trades.csv")
-
+    print(f"\nNa kosten ({cfg.fee_stocks*100:.2f}% aandelen, {cfg.fee_crypto*100:.2f}% crypto per kant). "
+          f"Break-even bij een {cfg.min_rr:g}R-doel ligt rond {100/(1+cfg.min_rr):.0f}% winrate vóór kosten.")
     token, chat = telegram_creds()
     if token and chat:
-        icon = {"hoog": "🟢", "gemiddeld": "🟡", "laag": "🔴", "te weinig data": "⚪"}
-        lines = [f"{icon[r['oordeel']]} {r['setup']}: {r['winrate']} win, {r['verw. R']}R (n={r['trades']})"
+        lines = [f"{ICON[r['oordeel']]} {r['setup']}: {r['winrate']} win, {r['verw. R']}R (n={r['trades']})"
                  for r in sorted(rows, key=lambda r: r["setup"])]
-        telegram_send(token, chat, "📊 Backtest bijgewerkt\n" + "\n".join(lines))
+        telegram_send(token, chat, f"📊 Backtest {DAY}-setups bijgewerkt (na kosten)\n" + "\n".join(lines)
+                      + "\n\nSwing-setups hebben geen backtest: hun uitstap (red zone) teken je zelf.")
+
+
+# --------------------------------------------------------------------------- #
+# Papertrading (alleen daytrades)
+# --------------------------------------------------------------------------- #
+
+def load_paper() -> pd.DataFrame:
+    if os.path.exists(PAPER_FILE):
+        return pd.read_csv(PAPER_FILE, dtype={"id": int, "sluit_tijd": object, "oordeel": object, "status": object})
+    return pd.DataFrame(columns=PAPER_COLS)
+
+
+def save_paper(df: pd.DataFrame):
+    df.to_csv(PAPER_FILE, index=False)
+
+
+def open_paper(paper: pd.DataFrame, s, cfg: Config):
+    """Opent een papertrade als dat volgens de regels mag. Geeft (paper, id of None, uitleg)."""
+    open_ = paper[paper["status"] == "open"]
+    if (open_["symbool"] == s["symbool"]).any():
+        return paper, None, "al een open papertrade in dit symbool"
+    if len(open_) >= cfg.max_positions:
+        return paper, None, f"al {cfg.max_positions} open (je regel: max {cfg.max_positions})"
+    pid = int(paper["id"].max()) + 1 if len(paper) else 1
+    row = {"id": pid, "markt": s["markt"], "symbool": s["symbool"], "setup": s["setup"], "richting": s["richting"],
+           "open_tijd": s["data_tijd"], "prijs": s["prijs"], "stop": s["stop"], "doel": s["doel_2R"],
+           "fee": cfg.fee(s["markt"]), "oordeel": s.get("oordeel", ""), "status": "open",
+           "sluit_tijd": "", "uitstap": np.nan, "R": np.nan}
+    return pd.concat([paper, pd.DataFrame([row])], ignore_index=True), pid, "geopend"
+
+
+def _session_date(ts: pd.Timestamp, market: str, symbol: str):
+    tz = "UTC" if market == "crypto" else SESSIONS["eu" if symbol.upper().endswith(EU_SUFFIXES) else "us"][0]
+    return ts.tz_convert(tz).date(), tz
+
+
+def evaluate_paper(trade: dict, bars: pd.DataFrame, now: pd.Timestamp | None = None):
+    """Bepaalt of een open papertrade gesloten is. bars = afgesloten 5m-candles. Geeft None of
+    (status, uitstap, sluit_tijd, R)."""
+    now = now or now_utc()
+    opened = pd.Timestamp(trade["open_tijd"])
+    day, tz = _session_date(opened, trade["markt"], trade["symbool"])
+    after = bars[bars.index > opened]
+    same = after[np.array(after.index.tz_convert(tz).date) == day]
+    long = trade["richting"] == "long"
+    if len(same):
+        hit = simulate(same["high"].to_numpy(), same["low"].to_numpy(), same["close"].to_numpy(),
+                       0, len(same) - 1, trade["prijs"], trade["stop"], trade["doel"], long)
+        if hit:
+            return hit[0], hit[1], str(same.index[hit[2]]), net_r(trade["prijs"], hit[1], trade["stop"], long, trade["fee"])
+    later_bars = len(after) > len(same)
+    local_now = now.tz_convert(tz)
+    if trade["markt"] == "crypto":
+        over = local_now.date() > day
+    else:
+        _, _, (ch, cm) = SESSIONS["eu" if trade["symbool"].upper().endswith(EU_SUFFIXES) else "us"]
+        over = later_bars or local_now.date() > day or (local_now.hour * 60 + local_now.minute) >= ch * 60 + cm + 10
+    if not over:
+        return None
+    exit_ = float(same["close"].iloc[-1]) if len(same) else float(trade["prijs"])
+    return "tijd", exit_, str(same.index[-1]) if len(same) else now.isoformat(), \
+        net_r(trade["prijs"], exit_, trade["stop"], long, trade["fee"])
+
+
+def update_paper(paper: pd.DataFrame, args, ex_getter) -> tuple[pd.DataFrame, list[dict]]:
+    closed = []
+    for idx in paper.index[paper["status"] == "open"]:
+        t = paper.loc[idx].to_dict()
+        try:
+            if t["markt"] == "crypto":
+                ex = ex_getter()
+                bars = closed_only(_ohlcv_df(ex.fetch_ohlcv(
+                    t["symbool"], "5m", since=int(pd.Timestamp(t["open_tijd"]).timestamp() * 1000), limit=1000)), 5)
+            else:
+                bars = stock_intraday(t["symbool"])
+            res = evaluate_paper(t, bars)
+        except Exception as e:
+            print(f"  ! papertrade {t['symbool']}: {e}", file=sys.stderr)
+            continue
+        if res:
+            paper.loc[idx, ["status", "uitstap", "sluit_tijd", "R"]] = [res[0], res[1], res[2], res[3]]
+            closed.append(paper.loc[idx].to_dict())
+    return paper, closed
+
+
+def paper_progress(paper: pd.DataFrame) -> list[str]:
+    done = paper[paper["status"] != "open"]
+    out = []
+    for (m, s, r), g in done.groupby(["markt", "setup", "richting"]):
+        out.append(f"{m} {s} ({r}): {len(g)}/30, gem. {g['R'].astype(float).mean():+.2f}R")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Swing-scanner (één keer per dag)
+# --------------------------------------------------------------------------- #
+
+def to_weekly(daily: pd.DataFrame, rule: str) -> pd.DataFrame:
+    w = daily.resample(rule).agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+    w = w.dropna(subset=["close"])
+    if len(w) and w.index[-1].date() > daily.index[-1].date():   # lopende week weglaten
+        w = w.iloc[:-1]
+    return w
+
+
+def swing_rules(symbol: str, market: str, daily: pd.DataFrame, cfg: Config) -> list[dict]:
+    """daily = alleen afgesloten dagcandles."""
+    out = []
+    if len(daily) < 80:
+        return out
+    c = daily["close"]
+    ribbon = pd.concat([ema(c, n) for n in range(20, 60, 5)], axis=1)   # EMA 20,25,...,55
+    top, bot = ribbon.max(axis=1), ribbon.min(axis=1)
+    above = c > top
+    if above.iloc[-1] and not above.iloc[-2]:
+        out.append(("Boven EMA Ribbon (dag)", float(bot.iloc[-1]),
+                    "dagslot terug onder de EMA Ribbon",
+                    "lijkt op de EMA Ribbon-voorwaarde van je 🟢 daily-alert (de MONTHLY-voorwaarde controleert de bot niet)"))
+    weekly = to_weekly(daily, "W-SUN" if market == "crypto" else "W-FRI")
+    if len(weekly) >= 30:
+        wt1, wt2 = wavetrend(weekly)
+        if wt1.iloc[-2] <= wt2.iloc[-2] and wt1.iloc[-1] > wt2.iloc[-1] and wt1.iloc[-1] < cfg.wt_oversold:
+            out.append(("WaveTrend-omslag in oversold (week)", float(weekly["low"].iloc[-8:].min()),
+                        "weekslot onder de laagste low van de laatste 8 weken",
+                        "lijkt op je 🟢 weekly-alert (VuManChu), maar is NIET identiek: check je indicator"))
+    sigs = []
+    entry = float(c.iloc[-1])
+    for setup, stop, stop_uitleg, relatie in out:
+        risk = entry - stop
+        if risk <= 0:
+            continue
+        qty, value, risk_eur, note = size_position(entry, stop, cfg, fractional=(market == "crypto"))
+        sigs.append({"type": "swing", "markt": market, "symbool": symbol, "setup": setup, "richting": "long",
+                     "prijs": entry, "stop": stop, "stop_uitleg": stop_uitleg, "min_red_zone": entry + cfg.min_rr * risk,
+                     "stop_pct": risk / entry * 100, "aantal": qty, "positiewaarde": value, "risico": risk_eur,
+                     "relatie": relatie, "opmerking": note, "datum": str(daily.index[-1].date())})
+    return sigs
+
+
+def swing_scan(cfg: Config, args, tickers: list[str]) -> list[dict]:
+    sigs = []
+    today_utc = now_utc().date()
+    if args.market in ("stocks", "all"):
+        def one(t):
+            d = stock_daily(t, "2y")
+            if len(d) and d.index[-1].date() >= dt.datetime.now(d.index.tz).date() and market_open(t):
+                d = d.iloc[:-1]     # dagcandle van vandaag is nog niet af
+            return swing_rules(t, "aandeel", d, cfg)
+        sigs += _parallel(one, tickers, workers=4)
+    if args.market in ("crypto", "all"):
+        ex = crypto_exchange(args.exchange)
+        syms = crypto_symbols(ex, args.quote, args.crypto_top, args.crypto_symbols, movers=0)
+        def one_c(s):
+            d = crypto_daily(ex, s, 500)
+            if len(d) and d.index[-1].date() >= today_utc:
+                d = d.iloc[:-1]
+            return swing_rules(s, "crypto", d, cfg)
+        sigs += _parallel(one_c, syms, workers=1)
+    return sigs
+
+
+def log_swing(sigs: list[dict]) -> list[dict]:
+    if not sigs:
+        return []
+    df = pd.DataFrame(sigs)
+    key = lambda d: d["datum"].astype(str) + "|" + d["symbool"] + "|" + d["setup"]
+    if os.path.exists(SWING_LOG):
+        old = pd.read_csv(SWING_LOG, usecols=["datum", "symbool", "setup"], dtype=str)
+        df = df[~key(df).isin(set(key(old)))]
+    if len(df):
+        df.to_csv(SWING_LOG, mode="a", header=not os.path.exists(SWING_LOG), index=False)
+    return df.to_dict("records")
 
 
 # --------------------------------------------------------------------------- #
@@ -468,8 +804,9 @@ def fmt_price(x):
 
 def print_table(df: pd.DataFrame, top: int):
     if df.empty:
-        print("Geen kansen die aan alle filters voldoen.")
+        print(f"{DAY}: geen kansen die aan alle filters voldoen.")
         return
+    print(f"{DAY} ({DAY_UITLEG}):")
     view = df.head(top).copy()
     for col in ("prijs", "stop", "doel_2R", "volgend_level", "positiewaarde", "risico"):
         view[col] = view[col].map(fmt_price)
@@ -479,15 +816,16 @@ def print_table(df: pd.DataFrame, top: int):
     view["gap_pct"] = view["gap_pct"].map(lambda v: "-" if pd.isna(v) else f"{v:+.1f}%")
     view["rsi_5m"] = view["rsi_5m"].map(lambda v: f"{v:.0f}")
     view["aantal"] = view["aantal"].map(lambda v: f"{v:g}")
+    view["kosten_R"] = view["kosten_R"].map(lambda v: f"{v:.2f}")
     view["verw_R"] = view["verw_R"].map(lambda v: "-" if pd.isna(v) else f"{v:+.2f}")
     cols = ["symbool", "setup", "richting", "prijs", "stop", "doel_2R", "volgend_level", "rr_tot_level",
-            "slagingskans", "verw_R", "oordeel", "rvol", "atr_pct", "gap_pct", "rsi_5m", "aantal",
+            "slagingskans", "verw_R", "oordeel", "kosten_R", "rvol", "atr_pct", "gap_pct", "rsi_5m", "aantal",
             "positiewaarde", "risico", "opmerking"]
     print(view[cols].to_string(index=False))
 
 
 def log_signals(df: pd.DataFrame, path: str) -> pd.DataFrame:
-    """Voegt nieuwe signalen toe aan een CSV (handig als papertrade-logboek). Geeft de nieuwe terug."""
+    """Voegt nieuwe signalen toe aan een CSV. Geeft de nieuwe terug (per dag/symbool/setup één keer)."""
     if df.empty:
         return df
     df = df.copy()
@@ -500,12 +838,8 @@ def log_signals(df: pd.DataFrame, path: str) -> pd.DataFrame:
     else:
         new = df
     if not new.empty:
-        new = new.assign(uitkomst="", notities="")  # in te vullen bij papertraden
         new.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
     return new
-
-
-CHAT_ID_FILE = os.path.join(STATE_DIR, "telegram_chat_id.txt")
 
 
 def discover_chat_id(token: str) -> str | None:
@@ -542,8 +876,10 @@ def telegram_creds():
     return token, chat
 
 
-def telegram_send(token: str, chat: str, text: str) -> bool:
-    data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+def telegram_send(token: str | None, chat: str | None, text: str) -> bool:
+    if not token or not chat:
+        return False
+    data = urllib.parse.urlencode({"chat_id": chat, "text": text[:4000]}).encode()
     try:
         urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=10)
         return True
@@ -569,47 +905,130 @@ def telegram_setup(token: str):
     print(f"Opgeslagen in {TELEGRAM_FILE} (chat-id {chat}). Testbericht {'verstuurd' if ok else 'MISLUKT'}.")
 
 
-def send_telegram(df: pd.DataFrame, minimum: str):
-    token, chat = telegram_creds()
-    if not token or not chat or df.empty:
-        return
-    df = df[df["oordeel"].map(JUDGE_RANK) >= JUDGE_RANK.get(minimum, 0)] if minimum != "alle" else df
-    icon = {"hoog": "🟢", "gemiddeld": "🟡", "laag": "🔴", "te weinig data": "⚪"}
-    for _, s in df.iterrows():
-        pijl = "⬆️" if s["richting"] == "long" else "⬇️"
-        text = (f"{pijl} {s['symbool']} – {s['setup']} ({s['richting']})\n"
-                f"Prijs {fmt_price(s['prijs'])} | stop {fmt_price(s['stop'])} | doel 2R {fmt_price(s['doel_2R'])}\n"
-                f"Aantal {s['aantal']:g} (risico {fmt_price(s['risico'])})\n"
-                f"{icon.get(s['oordeel'], '')} Slagingskans {s['slagingskans']} – {s['oordeel']}\n"
-                f"RVOL {s['rvol']:.1f}x | ATR {s['atr_pct']:.1f}%"
-                + (f"\n⚠️ {s['opmerking']}" if s["opmerking"] else ""))
-        telegram_send(token, chat, text)
+def msg_daytrade(s, paper_note: str) -> str:
+    pijl = "⬆️" if s["richting"] == "long" else "⬇️"
+    return (f"{DAY} – {DAY_UITLEG}\n"
+            f"{pijl} {s['symbool']} – {s['setup']} ({s['richting']})\n"
+            f"Prijs {fmt_price(s['prijs'])} | stop {fmt_price(s['stop'])} | doel 2R {fmt_price(s['doel_2R'])}\n"
+            f"Aantal {s['aantal']:g} (risico {fmt_price(s['risico'])})\n"
+            f"{ICON.get(s['oordeel'], '')} Slagingskans {s['slagingskans']} – {s['oordeel']} (na kosten)\n"
+            f"Kosten ≈ {s['kosten_R']:.2f}R | RVOL {s['rvol']:.1f}x | ATR {s['atr_pct']:.1f}%"
+            + (f"\n⚠️ {s['opmerking']}" if s["opmerking"] else "")
+            + f"\n📝 Papertrade: {paper_note}"
+            + "\nNiet gevuld vóór het eind van de dag? Dan vervalt hij.")
+
+
+def msg_paper_closed(t: dict) -> str:
+    icon = {"winst": "✅", "verlies": "❌", "tijd": "⏱"}[t["status"]]
+    uitleg = {"winst": "doel geraakt", "verlies": "stop geraakt", "tijd": "einde dag, gesloten op slotkoers"}[t["status"]]
+    return (f"{icon} {DAY} papertrade #{int(t['id'])} gesloten – {uitleg}\n"
+            f"{t['symbool']} – {t['setup']} ({t['richting']})\n"
+            f"In {fmt_price(t['prijs'])} → uit {fmt_price(float(t['uitstap']))} = {float(t['R']):+.2f}R na kosten")
+
+
+def msg_swing(s: dict) -> str:
+    return (f"{SWING} – {SWING_UITLEG}\n"
+            f"⬆️ {s['symbool']} – {s['setup']}\n"
+            f"Slot {fmt_price(s['prijs'])} | stop {fmt_price(s['stop'])} ({s['stop_pct']:.1f}% lager)\n"
+            f"Stop = {s['stop_uitleg']}\n"
+            f"Aantal {s['aantal']:g} (risico {fmt_price(s['risico'])} = 1%)\n"
+            f"🎯 Doel = jouw red zone (Fib, zelf tekenen). Alleen nemen als die boven "
+            f"{fmt_price(s['min_red_zone'])} ligt (1:2).\n"
+            f"ℹ️ {s['relatie']}.\n"
+            f"⚠️ Eerst checken op je TradingView-chart. Geen automatische papertrade, geen slagingspercentage.")
+
+
+def msg_summary(day_df: pd.DataFrame, paper: pd.DataFrame, swing_today: list[dict]) -> str:
+    today = dt.datetime.now(AMS).date()
+    lines = [f"📋 Dagoverzicht {today:%d-%m-%Y}", "", f"{DAY} ({DAY_UITLEG})"]
+    if len(day_df):
+        for _, s in day_df.iterrows():
+            lines.append(f"• {s['symbool']} {s['setup']} ({s['richting']}) – {s.get('oordeel', '')}")
+    else:
+        lines.append("• geen signalen vandaag")
+    done = paper[paper["status"] != "open"]
+    done = done[pd.to_datetime(done["sluit_tijd"], utc=True, errors="coerce").dt.tz_convert(AMS).dt.date == today]
+    lines += ["", "📝 Papertrades vandaag gesloten"]
+    if len(done):
+        for _, t in done.iterrows():
+            lines.append(f"• #{int(t['id'])} {t['symbool']} {t['setup']}: {float(t['R']):+.2f}R ({t['status']})")
+        lines.append(f"Totaal vandaag: {done['R'].astype(float).sum():+.2f}R")
+    else:
+        lines.append("• geen")
+    open_ = paper[paper["status"] == "open"]
+    lines += ["", f"📂 Nog open: {len(open_)}/3"] + [f"• #{int(t['id'])} {t['symbool']} {t['setup']}" for _, t in open_.iterrows()]
+    prog = paper_progress(paper)
+    if prog:
+        lines += ["", "📈 Op weg naar 30 papertrades per setup"] + [f"• {p}" for p in prog]
+    lines += ["", f"{SWING} ({SWING_UITLEG})"]
+    lines += [f"• {s['symbool']} – {s['setup']}" for s in swing_today] or ["• geen nieuwe swing-signalen"]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
+def load_state() -> dict:
+    if os.path.exists(DAY_STATE):
+        with open(DAY_STATE) as fh:
+            return json.load(fh)
+    return {}
+
+
+def save_state(state: dict):
+    with open(DAY_STATE, "w") as fh:
+        json.dump(state, fh)
+
+
+def summary_due(state: dict, cfg: Config) -> bool:
+    now = dt.datetime.now(AMS)
+    h, m = cfg.summary_time
+    return (now.hour, now.minute) >= (h, m) and state.get("laatste_overzicht") != now.date().isoformat()
+
+
 def run_once(args, cfg: Config, tickers: list[str], stats: dict):
-    print(f"\n=== Scan {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===")
-    if args.open_positions >= cfg.max_positions:
-        print(f"Let op: je hebt {args.open_positions} open posities (max {cfg.max_positions}). "
-              "Volgens je regels geen nieuwe trades; de scan is alleen ter info.")
+    print(f"\n=== Scan {dt.datetime.now(AMS):%Y-%m-%d %H:%M} (NL) ===")
+    state = load_state()
+    token, chat = telegram_creds()
+    ex_cache = {}
+    get_ex = lambda: ex_cache.setdefault("ex", crypto_exchange(args.exchange))
+
+    # 1. Open papertrades bijwerken
+    paper = load_paper()
+    paper, closed = update_paper(paper, args, get_ex)
+    for t in closed:
+        print(f"Papertrade #{int(t['id'])} {t['symbool']} gesloten: {t['status']} {float(t['R']):+.2f}R")
+        telegram_send(token, chat, msg_paper_closed(t))
+
+    # 2. Daytrade-scan
     sigs = []
     if args.market in ("stocks", "all"):
-        open_t = tickers if args.include_closed else [t for t in tickers if market_open(t)]
+        all_t = list(dict.fromkeys(tickers + ([] if args.no_dynamic else
+                                              (dynamic_stocks(state) if market_open("SPY") else []))))
+        open_t = all_t if args.include_closed else [t for t in all_t if market_open(t)]
         if open_t:
-            print(f"Aandelen scannen ({len(open_t)} met open beurs)...")
-            sigs += scan_stocks(open_t, cfg, args.include_closed)
+            print(f"Aandelen scannen ({len(open_t)} met open beurs, waarvan {len(open_t) - len([t for t in open_t if t in tickers])} uit de dynamische watchlist)...")
+            regs = stock_regimes(cfg)
+            for b, r in regs.items():
+                if last_regime(r) < 0:
+                    print(f"Marktfilter: {b} daalt hard, geen longs in die markt.")
+            sigs += scan_stocks(open_t, cfg, args.include_closed, regs)
         else:
             print("Aandelenbeurzen zijn dicht, aandelen overgeslagen.")
     if args.market in ("crypto", "all"):
-        print(f"Crypto scannen op {args.exchange} (top {args.crypto_top} {args.quote}-paren)...")
-        sigs += scan_crypto(cfg, args)
+        print(f"Crypto scannen op {args.exchange} (top {args.crypto_top} {args.quote}-paren + grootste bewegers)...")
+        sigs += scan_crypto(cfg, args, get_ex())
     df = pd.DataFrame(sigs)
     if not df.empty:
         if not args.show_all:
             df = df[df["rr_ok"]]
+        if not df.empty and not args.no_earnings:
+            keep = [not (r["markt"] == "aandeel" and earnings_soon(r["symbool"], state)) for _, r in df.iterrows()]
+            skipped = df[[not k for k in keep]]
+            for _, r in skipped.iterrows():
+                print(f"Overgeslagen: {r['symbool']} publiceert vandaag/morgen cijfers.")
+            df = df[keep]
         df = add_stats(df, stats, cfg) if not df.empty else df
     if not df.empty:
         df["_rank"] = df["oordeel"].map(JUDGE_RANK)
@@ -618,18 +1037,42 @@ def run_once(args, cfg: Config, tickers: list[str], stats: dict):
     new = log_signals(df, args.log)
     if not new.empty:
         print(f"{len(new)} nieuwe signalen gelogd in {args.log}")
-    send_telegram(new, args.telegram_min)
+        send = new if args.telegram_min == "alle" else new[new["oordeel"].map(JUDGE_RANK) >= JUDGE_RANK[args.telegram_min]]
+        for _, s in send.iterrows():
+            paper, pid, why = open_paper(paper, s, cfg)
+            note = f"#{pid} geopend – de bot houdt bij of stop of doel geraakt wordt" if pid else f"niet geopend: {why}"
+            telegram_send(token, chat, msg_daytrade(s, note))
+    save_paper(paper)
+
+    # 3. Eén keer per dag: swing-scan + dagoverzicht
+    if args.swing_now or summary_due(state, cfg):
+        print(f"\n{SWING} ({SWING_UITLEG}) scannen...")
+        swing_new = log_swing(swing_scan(cfg, args, tickers))
+        for s in swing_new:
+            print(f"  {s['symbool']}: {s['setup']} (stop {fmt_price(s['stop'])}, red zone moet boven {fmt_price(s['min_red_zone'])})")
+            telegram_send(token, chat, msg_swing(s))
+        if not swing_new:
+            print("  geen nieuwe swing-signalen")
+        today_log = pd.read_csv(args.log) if os.path.exists(args.log) else pd.DataFrame()
+        if len(today_log):
+            today_log = today_log[today_log["datum"].astype(str) == dt.date.today().isoformat()]
+        telegram_send(token, chat, msg_summary(today_log, paper, swing_new))
+        state["laatste_overzicht"] = dt.datetime.now(AMS).date().isoformat()
+    save_state(state)
 
 
 def main():
-    p = argparse.ArgumentParser(description="Daytrade-scanner voor aandelen en crypto")
+    p = argparse.ArgumentParser(description="Trade-scanner (daytrade + swing) voor aandelen en crypto")
     p.add_argument("--market", choices=["stocks", "crypto", "all"], default="all")
     p.add_argument("--account", type=float, default=10_000, help="accountgrootte (default 10000)")
     p.add_argument("--risk-pct", type=float, default=1.0, help="risico per trade in %% (default 1)")
-    p.add_argument("--open-positions", type=int, default=0, help="aantal posities dat je nu open hebt")
     p.add_argument("--min-rvol", type=float, default=1.5)
     p.add_argument("--min-atr-pct", type=float, default=2.0)
+    p.add_argument("--fee-stocks", type=float, default=0.05, help="kosten per kant in %% voor aandelen (default 0.05)")
+    p.add_argument("--fee-crypto", type=float, default=0.25, help="kosten per kant in %% voor crypto (default 0.25)")
     p.add_argument("--stocks-file", help="tekstbestand met één ticker per regel")
+    p.add_argument("--no-dynamic", action="store_true", help="geen dynamische watchlist (alleen de vaste lijst)")
+    p.add_argument("--no-earnings", action="store_true", help="aandelen met cijfers vandaag/morgen niet overslaan")
     p.add_argument("--exchange", default="bitvavo", help="ccxt-exchange-id (default bitvavo)")
     p.add_argument("--quote", default="EUR", help="quote-valuta voor crypto (default EUR)")
     p.add_argument("--crypto-top", type=int, default=30, help="aantal crypto-paren op volume")
@@ -641,11 +1084,12 @@ def main():
     p.add_argument("--top", type=int, default=15)
     p.add_argument("--loop", type=float, default=0, help="elke N minuten opnieuw scannen")
     p.add_argument("--log", default=os.path.join(STATE_DIR, "signals_log.csv"))
-    p.add_argument("--backtest", action="store_true", help="slagingspercentages per setup berekenen")
+    p.add_argument("--backtest", action="store_true", help="slagingspercentages daytrade-setups berekenen")
     p.add_argument("--bt-days", type=int, default=45, help="aantal dagen crypto-backtest (default 45)")
+    p.add_argument("--swing-now", action="store_true", help="swing-scan + dagoverzicht nu uitvoeren")
     p.add_argument("--telegram-setup", metavar="TOKEN", help="koppel je Telegram-bot en stuur een testbericht")
     p.add_argument("--telegram-min", choices=["alle", "gemiddeld", "hoog"], default="alle",
-                   help="alleen Telegram-meldingen vanaf dit oordeel (default alle)")
+                   help="alleen daytrade-meldingen vanaf dit oordeel (default alle)")
     args = p.parse_args()
     os.makedirs(STATE_DIR, exist_ok=True)
 
@@ -656,7 +1100,7 @@ def main():
         print("Waarschuwing: je regel is max 1% risico per trade.")
     cfg = Config(account=args.account, risk_pct=args.risk_pct, min_rvol=args.min_rvol,
                  min_atr_pct=args.min_atr_pct, shorts_stocks=not args.no_stock_shorts,
-                 shorts_crypto=args.crypto_shorts)
+                 shorts_crypto=args.crypto_shorts, fee_stocks=args.fee_stocks / 100, fee_crypto=args.fee_crypto / 100)
     tickers = DEFAULT_STOCKS
     if args.stocks_file:
         with open(args.stocks_file) as fh:
