@@ -69,6 +69,7 @@ jobs:
       - name: Foutmelding naar Telegram
         if: failure()
         run: |
+          CHAT="${TELEGRAM_CHAT_ID:-$(cat state/telegram_chat_id.txt 2>/dev/null)}"
           curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "chat_id=${CHAT}" \
             --data-urlencode "text=❌ Backtest mislukt: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
