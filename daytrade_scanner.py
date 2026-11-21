@@ -670,6 +670,9 @@ def main():
     if not stats:
         print("Nog geen slagingspercentages. Draai eerst: python daytrade_scanner.py --backtest")
     print("Scanner, geen advies. Papertrade een setup 30+ keer voordat je hem live gebruikt.")
+    token, chat = telegram_creds()  # koppelt Telegram meteen (ook als er geen signalen zijn)
+    if token:
+        print(f"Telegram: {'gekoppeld' if chat else 'nog niet gekoppeld – stuur je bot een bericht'}")
     while True:
         run_once(args, cfg, tickers, stats)
         if not args.loop:
