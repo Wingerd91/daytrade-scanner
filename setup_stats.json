@@ -1,55 +1,57 @@
 {
-  "gemaakt": "2026-11-22T06:14:20",
+  "gemaakt": "2026-11-22T11:02:57",
   "na_kosten": true,
   "kosten_per_kant": {
     "aandeel": 0.0005,
     "crypto": 0.0025
   },
+  "instellingen": {
+    "aandeel": {
+      "actief": false,
+      "min_stop_atr": 1.0,
+      "trend_filter": false,
+      "breakeven_r": 0.0,
+      "active_hours": null,
+      "max_cost_r": 0.25,
+      "R_train": -0.008894332619334713,
+      "R_test": -0.14453440915475022,
+      "n_train": 158,
+      "n_test": 108
+    },
+    "crypto": {
+      "actief": false
+    }
+  },
   "stats": {
     "aandeel|Breakdown low gisteren|short": {
-      "n": 43,
-      "winrate": 0.46511627906976744,
-      "avg_r": 0.22356995820870812
+      "n": 16,
+      "winrate": 0.4375,
+      "avg_r": 0.5417001524497318
     },
     "aandeel|Breakout high gisteren|long": {
-      "n": 25,
-      "winrate": 0.28,
-      "avg_r": -0.5201586592646145
+      "n": 4,
+      "winrate": 0.0,
+      "avg_r": -1.0530893523714404
     },
     "aandeel|ORB|long": {
-      "n": 29,
-      "winrate": 0.27586206896551724,
-      "avg_r": 0.23134995506324196
+      "n": 27,
+      "winrate": 0.25925925925925924,
+      "avg_r": 0.23228330556785937
     },
     "aandeel|ORB|short": {
-      "n": 27,
-      "winrate": 0.18518518518518517,
-      "avg_r": 0.05176860438935302
+      "n": 26,
+      "winrate": 0.15384615384615385,
+      "avg_r": -0.012175169136312558
     },
     "aandeel|VWAP-afwijzing|short": {
-      "n": 219,
-      "winrate": 0.319634703196347,
-      "avg_r": -0.24264299371996914
+      "n": 101,
+      "winrate": 0.2376237623762376,
+      "avg_r": -0.05793400352550619
     },
     "aandeel|VWAP-pullback|long": {
-      "n": 210,
-      "winrate": 0.29523809523809524,
-      "avg_r": -0.3594869101815991
-    },
-    "crypto|Breakout high gisteren|long": {
-      "n": 83,
-      "winrate": 0.3493975903614458,
-      "avg_r": -1.528333151921688
-    },
-    "crypto|ORB|long": {
-      "n": 190,
-      "winrate": 0.4368421052631579,
-      "avg_r": -0.8958898091057566
-    },
-    "crypto|VWAP-pullback|long": {
-      "n": 373,
-      "winrate": 0.35924932975871315,
-      "avg_r": -1.9468890947264994
+      "n": 92,
+      "winrate": 0.21739130434782608,
+      "avg_r": -0.23449593770641086
     }
   }
 }
