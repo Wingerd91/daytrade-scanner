@@ -1,5 +1,5 @@
 {
-  "gemaakt": "2026-11-22T11:02:57",
+  "gemaakt": "2026-11-22T11:19:26",
   "na_kosten": true,
   "kosten_per_kant": {
     "aandeel": 0.0005,
@@ -52,6 +52,48 @@
       "n": 92,
       "winrate": 0.21739130434782608,
       "avg_r": -0.23449593770641086
+    }
+  },
+  "swing_stats": {
+    "aandeel|Boven EMA Ribbon (dag)": {
+      "n": 4012,
+      "winrate": 0.40279162512462613,
+      "avg_r": 0.17241708739686246,
+      "avg_r3": 0.28268905635043823,
+      "winrate3": 0.32676969092721836,
+      "dagen": 4.0,
+      "n_test": 1208,
+      "avg_r_test": 0.08316607076226151
+    },
+    "aandeel|WaveTrend-omslag in oversold (week)": {
+      "n": 196,
+      "winrate": 0.37755102040816324,
+      "avg_r": 0.21865851614559448,
+      "avg_r3": 0.3268202171294223,
+      "winrate3": 0.2857142857142857,
+      "dagen": 15.0,
+      "n_test": 59,
+      "avg_r_test": 0.5716336892422356
+    },
+    "crypto|Boven EMA Ribbon (dag)": {
+      "n": 1285,
+      "winrate": 0.3159533073929961,
+      "avg_r": -0.1698917091835594,
+      "avg_r3": -0.1590240049034038,
+      "winrate3": 0.2396887159533074,
+      "dagen": 3.0,
+      "n_test": 388,
+      "avg_r_test": -0.04685877785481588
+    },
+    "crypto|WaveTrend-omslag in oversold (week)": {
+      "n": 69,
+      "winrate": 0.463768115942029,
+      "avg_r": 0.3957157582077911,
+      "avg_r3": 0.3576025035823641,
+      "winrate3": 0.3333333333333333,
+      "dagen": 22.0,
+      "n_test": 24,
+      "avg_r_test": 0.6490664087510934
     }
   }
 }
