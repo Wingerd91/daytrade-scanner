@@ -12,8 +12,8 @@ Scant de markt en stuurt kansen naar Telegram. **De bot plaatst geen orders** en
 | **Stop** | Vast, staat in het bericht | Vast, staat in het bericht |
 | **Doel** | Vast: 2× je risico (2R) | **Jouw red zone** (Fib, zelf tekenen). De bot zegt hoe hoog die minimaal moet liggen voor 1:2 |
 | **Niet geraakt?** | Om het eind van de dag sluiten | Blijven houden tot red zone of stop |
-| **Slagingspercentage** | Ja (backtest, na kosten) | Nee |
-| **Automatische papertrade** | Ja | Nee, zelf bijhouden |
+| **Slagingspercentage** | Ja (backtest, na kosten) | Ja (backtest op jaren dagdata, met 2R als benadering van je red zone) |
+| **Automatische papertrade** | Ja | Ja (stop en 2R-doel, max. 6 maanden) |
 
 **Gouden regel:** staat er ⚡ bovenaan, dan is de trade vandaag klaar. Staat er 🟣, dan is het een lange trade. Een ⚡-trade die verliest **niet** "even laten staan" als swing: dat is precies hoe accounts leeglopen.
 
@@ -52,6 +52,12 @@ Shorts zijn het spiegelbeeld (alleen aandelen; spot-crypto kun je niet shorten).
 | WaveTrend-omslag in oversold (week) | WaveTrend (VuManChu B, 9/12/3) kruist omhoog onder −53 | weekslot onder de laagste low van 8 weken | lijkt op je 🟢 weekly-alert, maar is **niet identiek** |
 
 De bot kan je eigen TradingView-alerts (gold dot, monthly-alert, red zone) **niet** precies namaken. Gebruik swing-signalen als seintje om je chart te openen, niet als vervanging van je eigen alerts.
+
+**Swing-backtest:** elke week speelt de bot beide setups na op 10 jaar dagdata (aandelen) en tot ~4 jaar (crypto). Hij stapt in op het dagslot en gebruikt de stop uit het signaal. Als doel neemt hij 2R, als benadering van je red zone; ter vergelijking rekent hij ook 3R door. Na ± 6 maanden (126 handelsdagen) sluit hij op de slotkoers. Kosten worden afgetrokken. Net als bij daytrade controleert hij of het resultaat ook in de laatste 30% van de tijd standhoudt. Doet het dat niet, dan wordt het oordeel 🔴.
+
+Let op: de aandelenlijst bestaat uit bedrijven die het nu goed doen. Daardoor ziet het verleden er voor deze aandelen wat rooskleuriger uit dan het in werkelijkheid was.
+
+**Swing-papertrades:** bij elk swing-signaal opent de bot een papertrade met de stop uit het signaal en een 2R-doel. Elke dag controleert hij of de stop of het doel geraakt is, en na ± 6 maanden sluit hij de trade. Swing- en daytrade-papertrades delen samen de grens van 3 open posities (je regel).
 
 ## Slagingspercentage (alleen ⚡)
 
