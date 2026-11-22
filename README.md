@@ -64,6 +64,24 @@ De backtest speelt alle daytrade-setups na op ~60 dagen (aandelen) en 45 dagen (
 
 Een paar maanden historie is weinig. Je papertrades zijn uiteindelijk betrouwbaarder.
 
+### Filters tegen "de stop wordt steeds geraakt"
+
+Elke week test de backtest per markt (aandelen en crypto) 12 tot 24 combinaties van deze filters op echte koersen:
+
+| Filter | Wat het doet | Waarom |
+|---|---|---|
+| **Minimale stopafstand** (0,5 / 1 / 1,5× ATR) | Slaat setups over waarvan het invalidatiepunt binnen de normale koersruis van een paar minuten ligt | Zo'n stop wordt vaak "toevallig" geraakt, en de kosten eten een groot deel van je risico op. De stop blijft gewoon op het invalidatiepunt; de bot neemt zo'n trade alleen niet |
+| **Kostenfilter** (max. 0,25R) | Slaat trades over waarbij de kosten meer dan een kwart van je risico zijn | Vooral bij crypto met 0,25% per kant |
+| **Trendfilter** (aan/uit) | Long alleen als de koers gisteren boven het 20-daags gemiddelde sloot, short omgekeerd | Niet tegen de grote trend in handelen |
+| **Break-even** (aan/uit) | Stop naar je instapprijs zodra de koers 1R in je voordeel staat | Minder volle verliezen, al worden ook wat winners afgekapt |
+| **Tijdvenster crypto** (aan/uit) | Alleen 14:00–22:00 Nederlandse tijd, als Amerika open is | 's Nachts en in het weekend is crypto vaak grillig met weinig volume |
+
+**Zo kiest de bot zonder zichzelf voor de gek te houden:** hij kiest de beste combinatie op de eerste 70% van de dagen. Daarna controleert hij die keuze op de laatste 30%, data die hij bij het kiezen niet gezien heeft. Alleen als hij ook daar winst geeft na kosten, gaat de markt **aan**. Zo niet, dan staat daytrade voor die markt **uit** (⛔ in Telegram) en krijg je er geen signalen of papertrades van. Swing-signalen gaan altijd door.
+
+Je krijgt standaard alleen daytrade-signalen van 🟢- en 🟡-setups. Alleen die worden gepapertraded.
+
+**Verwachting:** ook met goede instellingen verlies je de meeste trades. Bij een 2R-doel speel je met ~35% winst quitte en is 40–45% al goed. Vijf verliezers op rij is dus normaal. Beoordeel een setup pas na 30 papertrades.
+
 ## Papertrading (alleen ⚡)
 
 Bij elk daytrade-signaal opent de bot een papertrade, behalve als er al 3 open staan (je regel) of als er al een open papertrade in hetzelfde symbool loopt. Daarna controleert hij elke scan of eerst de stop of eerst het doel geraakt is. Wordt geen van beide geraakt, dan sluit hij aan het eind van de dag op de slotkoers. Instap is de slotkoers van de signaalcandle; in het echt kan je instap iets afwijken.
@@ -74,7 +92,9 @@ Het dagoverzicht laat per setup zien hoeveel papertrades je hebt (doel: 30) en w
 
 Op GitHub: **Settings → Secrets and variables → Actions → Variables → New repository variable**, naam `SCAN_ARGS`. Voorbeelden:
 
-- `--telegram-min gemiddeld`: alleen 🟡 en 🟢 daytrade-meldingen
+- `--telegram-min hoog`: alleen 🟢 daytrade-meldingen (standaard: 🟢 en 🟡)
+- `--telegram-min alle`: ook 🔴 en ⚪ meldingen (die worden dan ook gepapertraded)
+- `--force-active`: ook daytrade-signalen in een markt die de backtest heeft uitgezet (niet aan te raden)
 - `--account 5000`: positiegrootte op basis van €5.000
 - `--fee-crypto 0.15`: als je bij Bitvavo minder betaalt (in %)
 - `--no-dynamic`: alleen de vaste aandelenlijst
