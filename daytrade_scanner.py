@@ -66,7 +66,7 @@ EU_SUFFIXES = (".AS", ".DE", ".PA", ".BR", ".MI", ".MC", ".L", ".SW", ".CO", ".S
 SESSIONS = {"us": ("America/New_York", (9, 30), (16, 0)), "eu": ("Europe/Amsterdam", (9, 0), (17, 30))}
 JUDGE_RANK = {"te weinig data": 0, "laag": 1, "gemiddeld": 2, "hoog": 3}
 ICON = {"hoog": "🟢", "gemiddeld": "🟡", "laag": "🔴", "te weinig data": "⚪"}
-PAPER_COLS = ["id", "markt", "symbool", "setup", "richting", "open_tijd", "prijs", "stop", "doel",
+PAPER_COLS = ["id", "type", "markt", "symbool", "setup", "richting", "open_tijd", "prijs", "stop", "doel",
               "fee", "be_r", "oordeel", "status", "sluit_tijd", "uitstap", "R"]
 
 
@@ -692,10 +692,8 @@ def run_backtest(args, tickers: list[str], cfg: Config):
         cands += _parallel(lambda s: candidates_symbol(s, "crypto", crypto_intraday(ex, s, args.bt_days),
                                                        crypto_daily(ex, s, args.bt_days + 60), cfg, btc_reg),
                            syms, workers=1)
-    if not cands:
-        print("Geen trades gevonden in de backtest.")
-        return
-    cdf = pd.DataFrame(cands)
+    swing_st = run_swing_backtest(args, tickers, cfg)
+    cdf = pd.DataFrame(cands) if cands else pd.DataFrame(columns=["markt"])
     trades, settings, report = [], {}, []
     tested = [m for m, a in (("aandeel", ("stocks", "all")), ("crypto", ("crypto", "all"))) if args.market in a]
     for market in tested:
@@ -726,7 +724,7 @@ def run_backtest(args, tickers: list[str], cfg: Config):
     with open(STATS_FILE, "w") as fh:
         json.dump({"gemaakt": dt.datetime.now().isoformat(timespec="seconds"), "na_kosten": True,
                    "kosten_per_kant": {"aandeel": cfg.fee_stocks, "crypto": cfg.fee_crypto},
-                   "instellingen": settings, "stats": stats}, fh, indent=2)
+                   "instellingen": settings, "stats": stats, "swing_stats": swing_st}, fh, indent=2)
     rows = [{"setup": k.replace("|", " / "), "trades": v["n"], "winrate": f"{v['winrate']*100:.0f}%",
              "verw. R": f"{v['avg_r']:+.2f}", "oordeel": judge(v, cfg)} for k, v in stats.items()]
     if rows:
@@ -755,21 +753,33 @@ def run_backtest(args, tickers: list[str], cfg: Config):
                     o = judge(v, cfg)
                     lines.append(f"{ICON[o]} {esc(setup)} ({richting}): {v['winrate']*100:.0f}% win, "
                                  f"<b>{v['avg_r']:+.2f}R</b> · {o} (n={v['n']})")
+        sw = []
+        for k, v in sorted(swing_st.items()):
+            m, setup = k.split("|")
+            o = judge_swing(v, cfg)
+            ctrl = f", controle {v['avg_r_test']:+.2f}R" if v.get("avg_r_test") is not None else ""
+            sw.append(f"{ICON[o]} {'🪙' if m == 'crypto' else '📈'} {esc(setup)}: {v['winrate']*100:.0f}% win, "
+                      f"<b>{v['avg_r']:+.2f}R</b>{ctrl} · {o} (n={v['n']}, ± {v['dagen']:.0f} dagen)")
         telegram_send(token, chat,
                       "📊 <b>STATISTIEK – dit is GEEN signaal</b>\n"
-                      f"Wekelijkse test van de {DAY}-setups op echte koersen, na kosten.\n"
-                      f"{LIJN}\n" + "\n".join(lines) + f"\n{LIJN}\n"
-                      "Je krijgt alleen signalen van 🟢/🟡-setups in een actieve markt.\n"
+                      "Wekelijkse test op echte koersen, na kosten.\n"
+                      f"{LIJN}\n🟣 <b>SWING</b> (doel 2R als benadering van je red zone, max. 6 maanden)\n"
+                      + ("\n".join(sw) if sw else "• geen data") +
+                      f"\n{LIJN}\n⚡ <b>DAYTRADE</b>\n" + "\n".join(lines) + f"\n{LIJN}\n"
+                      "🟢 hoog ≥ +0,25R · 🟡 gemiddeld · 🔴 laag (verliesgevend) · ⚪ te weinig data\n"
                       "Ook goede setups verliezen vaak: bij een 2R-doel is ±40% winst al winstgevend.")
 
 
 # --------------------------------------------------------------------------- #
-# Papertrading (alleen daytrades)
+# Papertrading (daytrade en swing)
 # --------------------------------------------------------------------------- #
 
 def load_paper() -> pd.DataFrame:
     if os.path.exists(PAPER_FILE):
-        return pd.read_csv(PAPER_FILE, dtype={"id": int, "sluit_tijd": object, "oordeel": object, "status": object})
+        df = pd.read_csv(PAPER_FILE, dtype={"id": int, "sluit_tijd": object, "oordeel": object, "status": object})
+        if "type" not in df.columns:
+            df["type"] = "daytrade"
+        return df
     return pd.DataFrame(columns=PAPER_COLS)
 
 
@@ -785,9 +795,9 @@ def open_paper(paper: pd.DataFrame, s, cfg: Config):
     if len(open_) >= cfg.max_positions:
         return paper, None, f"al {cfg.max_positions} open (je regel: max {cfg.max_positions})"
     pid = int(paper["id"].max()) + 1 if len(paper) else 1
-    row = {"id": pid, "markt": s["markt"], "symbool": s["symbool"], "setup": s["setup"], "richting": s["richting"],
+    row = {"id": pid, "type": s.get("type", "daytrade"), "markt": s["markt"], "symbool": s["symbool"], "setup": s["setup"], "richting": s["richting"],
            "open_tijd": s["data_tijd"], "prijs": s["prijs"], "stop": s["stop"], "doel": s["doel_2R"],
-           "fee": cfg.fee(s["markt"]), "be_r": cfg.breakeven_r, "oordeel": s.get("oordeel", ""), "status": "open",
+           "fee": cfg.fee(s["markt"]), "be_r": cfg.breakeven_r if s.get("type", "daytrade") == "daytrade" else 0.0, "oordeel": s.get("oordeel", ""), "status": "open",
            "sluit_tijd": "", "uitstap": np.nan, "R": np.nan}
     return pd.concat([paper, pd.DataFrame([row])], ignore_index=True), pid, "geopend"
 
@@ -827,11 +837,35 @@ def evaluate_paper(trade: dict, bars: pd.DataFrame, now: pd.Timestamp | None = N
         net_r(trade["prijs"], exit_, trade["stop"], long, trade["fee"])
 
 
+def evaluate_swing_paper(trade: dict, daily: pd.DataFrame):
+    """Swing-papertrade: stop of 2R-doel op dagcandles na de signaaldag, anders uitstap na ± 6 maanden."""
+    opened = pd.Timestamp(trade["open_tijd"])
+    after = daily[np.array(daily.index.date) > opened.date()]
+    if after.empty:
+        return None
+    n = min(len(after), SWING_MAX_DAYS)
+    hit = simulate(after["high"].to_numpy(), after["low"].to_numpy(), after["close"].to_numpy(),
+                   0, n - 1, trade["prijs"], trade["stop"], trade["doel"], True)
+    if hit:
+        return hit[0], hit[1], str(after.index[hit[2]]), net_r(trade["prijs"], hit[1], trade["stop"], True, trade["fee"])
+    if len(after) >= SWING_MAX_DAYS:
+        exit_ = float(after["close"].iloc[n - 1])
+        return "tijd", exit_, str(after.index[n - 1]), net_r(trade["prijs"], exit_, trade["stop"], True, trade["fee"])
+    return None
+
+
 def update_paper(paper: pd.DataFrame, args, ex_getter) -> tuple[pd.DataFrame, list[dict]]:
     closed = []
     for idx in paper.index[paper["status"] == "open"]:
         t = paper.loc[idx].to_dict()
         try:
+            if t.get("type") == "swing":
+                d = crypto_daily(ex_getter(), t["symbool"], 400) if t["markt"] == "crypto" else stock_daily(t["symbool"], "1y")
+                res = evaluate_swing_paper(t, d)
+                if res:
+                    paper.loc[idx, ["status", "uitstap", "sluit_tijd", "R"]] = [res[0], res[1], res[2], res[3]]
+                    closed.append(paper.loc[idx].to_dict())
+                continue
             if t["markt"] == "crypto":
                 ex = ex_getter()
                 bars = closed_only(_ohlcv_df(ex.fetch_ohlcv(
@@ -868,38 +902,132 @@ def to_weekly(daily: pd.DataFrame, rule: str) -> pd.DataFrame:
     return w
 
 
-def swing_rules(symbol: str, market: str, daily: pd.DataFrame, cfg: Config) -> list[dict]:
-    """daily = alleen afgesloten dagcandles."""
+SWING_MAX_DAYS = 126          # ± 6 maanden aan handelsdagen (je regel: 1–6 maanden vasthouden)
+SWING_RELATIE = {
+    "Boven EMA Ribbon (dag)": "lijkt op de EMA Ribbon-voorwaarde van je 🟢 daily-alert (de MONTHLY-voorwaarde controleert de bot niet)",
+    "WaveTrend-omslag in oversold (week)": "lijkt op je 🟢 weekly-alert (VuManChu), maar is NIET identiek: check je indicator",
+}
+SWING_STOP_UITLEG = {
+    "Boven EMA Ribbon (dag)": "onderkant van de EMA Ribbon op de signaaldag",
+    "WaveTrend-omslag in oversold (week)": "laagste low van de laatste 8 weken",
+}
+
+
+def swing_events(daily: pd.DataFrame, market: str, cfg: Config) -> list[tuple[int, str, float]]:
+    """Alle swing-signalen in een reeks afgesloten dagcandles: (positie van de signaaldag, setup, stop).
+    De live scan kijkt alleen naar de laatste dag, de backtest naar alle dagen: dezelfde logica."""
     out = []
     if len(daily) < 80:
         return out
     c = daily["close"]
     ribbon = pd.concat([ema(c, n) for n in range(20, 60, 5)], axis=1)   # EMA 20,25,...,55
-    top, bot = ribbon.max(axis=1), ribbon.min(axis=1)
-    above = c > top
-    if above.iloc[-1] and not above.iloc[-2]:
-        out.append(("Boven EMA Ribbon (dag)", float(bot.iloc[-1]),
-                    "dagslot terug onder de EMA Ribbon",
-                    "lijkt op de EMA Ribbon-voorwaarde van je 🟢 daily-alert (de MONTHLY-voorwaarde controleert de bot niet)"))
+    top, bot = ribbon.max(axis=1).to_numpy(), ribbon.min(axis=1).to_numpy()
+    above = c.to_numpy() > top
+    for pos in np.where(above[1:] & ~above[:-1])[0] + 1:
+        if pos >= 79:          # zelfde minimum (80 dagen) als de live scan
+            out.append((int(pos), "Boven EMA Ribbon (dag)", float(bot[pos])))
     weekly = to_weekly(daily, "W-SUN" if market == "crypto" else "W-FRI")
     if len(weekly) >= 30:
-        wt1, wt2 = wavetrend(weekly)
-        if wt1.iloc[-2] <= wt2.iloc[-2] and wt1.iloc[-1] > wt2.iloc[-1] and wt1.iloc[-1] < cfg.wt_oversold:
-            out.append(("WaveTrend-omslag in oversold (week)", float(weekly["low"].iloc[-8:].min()),
-                        "weekslot onder de laagste low van de laatste 8 weken",
-                        "lijkt op je 🟢 weekly-alert (VuManChu), maar is NIET identiek: check je indicator"))
+        wt1, wt2 = (x.to_numpy() for x in wavetrend(weekly))
+        ddates = _dates(daily.index)
+        lows = weekly["low"].to_numpy()
+        for k in range(30, len(weekly)):
+            if wt1[k - 1] <= wt2[k - 1] and wt1[k] > wt2[k] and wt1[k] < cfg.wt_oversold:
+                pos = int(np.searchsorted(ddates, np.datetime64(weekly.index[k].date(), "D"), side="right") - 1)
+                if 0 <= pos < len(daily):
+                    out.append((pos, "WaveTrend-omslag in oversold (week)", float(lows[k - 7:k + 1].min())))
+    return sorted(out)
+
+
+def swing_rules(symbol: str, market: str, daily: pd.DataFrame, cfg: Config) -> list[dict]:
+    """Swing-signalen op de laatste afgesloten dagcandle."""
     sigs = []
-    entry = float(c.iloc[-1])
-    for setup, stop, stop_uitleg, relatie in out:
+    last = len(daily) - 1
+    for pos, setup, stop in swing_events(daily, market, cfg):
+        if pos != last:
+            continue
+        entry = float(daily["close"].iloc[pos])
         risk = entry - stop
         if risk <= 0:
             continue
         qty, value, risk_eur, note = size_position(entry, stop, cfg, fractional=(market == "crypto"))
         sigs.append({"type": "swing", "markt": market, "symbool": symbol, "setup": setup, "richting": "long",
-                     "prijs": entry, "stop": stop, "stop_uitleg": stop_uitleg, "min_red_zone": entry + cfg.min_rr * risk,
+                     "prijs": entry, "stop": stop, "stop_uitleg": SWING_STOP_UITLEG[setup],
+                     "min_red_zone": entry + cfg.min_rr * risk, "doel_2R": entry + cfg.min_rr * risk,
                      "stop_pct": risk / entry * 100, "aantal": qty, "positiewaarde": value, "risico": risk_eur,
-                     "relatie": relatie, "opmerking": note, "datum": str(daily.index[-1].date())})
+                     "relatie": SWING_RELATIE[setup], "opmerking": note, "datum": str(daily.index[pos].date()),
+                     "data_tijd": daily.index[pos].tz_convert("UTC").isoformat() if daily.index.tz else str(daily.index[pos])})
     return sigs
+
+
+def swing_backtest_symbol(symbol: str, market: str, daily: pd.DataFrame, cfg: Config) -> list[dict]:
+    """Speelt elk swing-signaal na: instap op het dagslot, stop zoals in het signaal, doel 2R (en ter vergelijking 3R)
+    als benadering van je red zone, uitstap na max. ± 6 maanden. Kosten afgetrokken. Lopende trades tellen niet mee."""
+    H, L, C = daily["high"].to_numpy(), daily["low"].to_numpy(), daily["close"].to_numpy()
+    fee, n = cfg.fee(market), len(daily)
+    out = []
+    for pos, setup, stop in swing_events(daily, market, cfg):
+        entry = C[pos]
+        risk = entry - stop
+        if risk <= 0 or risk / entry > 0.30:
+            continue
+        rec = {"markt": market, "symbool": symbol, "setup": setup, "datum": str(daily.index[pos].date())}
+        for tgt in (2, 3):
+            end = min(pos + SWING_MAX_DAYS, n - 1)
+            hit = simulate(H, L, C, pos + 1, end, entry, stop, entry + tgt * risk, True)
+            if hit is None and pos + SWING_MAX_DAYS > n - 1:
+                rec = None        # nog lopend: uitkomst onbekend
+                break
+            res, exit_ = (hit[0], hit[1]) if hit else ("tijd", C[end])
+            rec[f"res{tgt}"], rec[f"R{tgt}"] = res, net_r(entry, exit_, stop, True, fee)
+            rec[f"dagen{tgt}"] = (hit[2] if hit else end) - pos
+        if rec:
+            out.append(rec)
+    return out
+
+
+def summarize_swing(tr: pd.DataFrame) -> dict:
+    """Per markt/setup: resultaat met 2R-doel, ter vergelijking 3R, en een controle op de laatste 30% van de tijd."""
+    out = {}
+    for (m, s), g in tr.groupby(["markt", "setup"]):
+        g = g.sort_values("datum")
+        split = g["datum"].iloc[int(len(g) * 0.7)] if len(g) >= 10 else None
+        test = g[g["datum"] >= split] if split else g.iloc[0:0]
+        out[f"{m}|{s}"] = {"n": int(len(g)), "winrate": float((g["res2"] == "winst").mean()),
+                           "avg_r": float(g["R2"].mean()), "avg_r3": float(g["R3"].mean()),
+                           "winrate3": float((g["res3"] == "winst").mean()),
+                           "dagen": float(g["dagen2"].median()),
+                           "n_test": int(len(test)), "avg_r_test": float(test["R2"].mean()) if len(test) else None}
+    return out
+
+
+def judge_swing(st: dict | None, cfg: Config) -> str:
+    o = judge(st, cfg)
+    if o in ("hoog", "gemiddeld") and st.get("n_test", 0) >= 10 and (st.get("avg_r_test") or 0) <= 0:
+        return "laag"           # winst verdween in de controleperiode
+    return o
+
+
+def run_swing_backtest(args, tickers: list[str], cfg: Config) -> dict:
+    tr = []
+    if args.market in ("stocks", "all"):
+        print(f"\nSwing-backtest aandelen ({len(tickers)}, 10 jaar dagdata)...")
+        tr += _parallel(lambda t: swing_backtest_symbol(t, "aandeel", stock_daily(t, "10y"), cfg), tickers, workers=4)
+    if args.market in ("crypto", "all"):
+        ex = crypto_exchange(args.exchange)
+        syms = crypto_symbols(ex, args.quote, args.crypto_top, args.crypto_symbols, movers=0)
+        print(f"Swing-backtest crypto ({len(syms)} paren, max. ± 4 jaar dagdata)...")
+        tr += _parallel(lambda s: swing_backtest_symbol(s, "crypto", crypto_daily(ex, s, 1440), cfg), syms, workers=1)
+    if not tr:
+        return {}
+    tdf = pd.DataFrame(tr)
+    tdf.to_csv(os.path.join(STATE_DIR, "swing_backtest_trades.csv"), index=False)
+    st = summarize_swing(tdf)
+    for k, v in st.items():
+        print(f"  {k.replace('|', ' / ')}: n={v['n']}, 2R: {v['winrate']*100:.0f}% win {v['avg_r']:+.2f}R, "
+              f"3R: {v['avg_r3']:+.2f}R, controle {v['avg_r_test'] if v['avg_r_test'] is None else round(v['avg_r_test'], 2)}R, "
+              f"mediaan {v['dagen']:.0f} dagen → {judge_swing(v, cfg)}")
+    return st
 
 
 def swing_scan(cfg: Config, args, tickers: list[str]) -> list[dict]:
@@ -1121,18 +1249,32 @@ def msg_daytrade(s, paper_note: str) -> str:
 
 
 def msg_paper_closed(t: dict) -> str:
-    icon = {"winst": "✅", "verlies": "❌", "tijd": "⏱"}[t["status"]]
-    uitleg = {"winst": "doel geraakt", "verlies": "stop geraakt", "tijd": "einde dag, gesloten op slotkoers"}[t["status"]]
+    swing = t.get("type") == "swing"
+    icon = {"winst": "✅", "verlies": "❌", "tijd": "⏱", "break-even": "➖"}[t["status"]]
+    uitleg = {"winst": "doel geraakt" + (" (2R, benadering red zone)" if swing else ""), "verlies": "stop geraakt",
+              "break-even": "gesloten op instapprijs (break-even)",
+              "tijd": "6 maanden voorbij, gesloten op slotkoers" if swing else "einde dag, gesloten op slotkoers"}[t["status"]]
     sym, m = t["symbool"], t["markt"]
-    return (f"{icon} <b>PAPERTRADE #{int(t['id'])} GESLOTEN</b> · ⚡ daytrade\n{LIJN}\n"
+    soort = "🟣 swing" if swing else "⚡ daytrade"
+    return (f"{icon} <b>PAPERTRADE #{int(t['id'])} GESLOTEN</b> · {soort}\n{LIJN}\n"
             f"<b>{esc(sym)}</b> · {esc(t['setup'])} · {t['richting']}\n"
             f"{uitleg.capitalize()}\n"
             f"In {money(t['prijs'], sym, m)} → uit {money(float(t['uitstap']), sym, m)}\n"
             f"Resultaat: <b>{float(t['R']):+.2f}R</b> na kosten")
 
 
-def msg_swing(s: dict) -> str:
+def msg_swing(s: dict, st: dict | None = None, paper_note: str = "", cfg: Config | None = None) -> str:
     sym, m = s["symbool"], s["markt"]
+    cfg = cfg or Config()
+    o = judge_swing(st, cfg)
+    if st:
+        ctrl = f" · controleperiode {st['avg_r_test']:+.2f}R" if st.get("avg_r_test") is not None else ""
+        kans = (f"{ICON[o]} Slagingskans: <b>{st['winrate']*100:.0f}% (n={st['n']}) · {o}</b>\n"
+                f"     gem. <b>{st['avg_r']:+.2f}R</b> bij 2R-doel{ctrl}; bij 3R-doel {st['avg_r3']:+.2f}R\n"
+                f"     doorlooptijd ± {st['dagen']:.0f} handelsdagen")
+    else:
+        kans = "⚪ Slagingskans: nog geen backtest"
+    waarschuwing = "\n⛔ <b>Deze setup was verliesgevend in de backtest.</b> Alleen papertraden." if o == "laag" else ""
     return (f"🟣 <b>SWING</b> · dagen tot maanden vasthouden\n"
             f"<i>Dit is GEEN daytrade.</i>\n{LIJN}\n"
             f"{kop(sym, m, 'long')}\n"
@@ -1143,8 +1285,10 @@ def msg_swing(s: dict) -> str:
             f"     ➜ alleen nemen als die boven <b>{money(s['min_red_zone'], sym, m)}</b> ligt (1:2)\n"
             f"📦 Aantal: {s['aantal']:g} · inzet {money(s['positiewaarde'], sym, m)} · risico {money(s['risico'], sym, m)}\n"
             f"{LIJN}\n"
+            f"{kans}{waarschuwing}\n"
             f"ℹ️ {esc(s['relatie'])}.\n"
-            f"⚠️ Eerst checken op je chart. Geen papertrade, geen slagingskans.\n"
+            + (f"📝 Papertrade: {esc(paper_note)}\n" if paper_note else "") +
+            f"⚠️ Eerst checken op je chart.\n"
             f"{chart_link(sym, m)}")
 
 
@@ -1165,14 +1309,15 @@ def msg_summary(day_df: pd.DataFrame, paper: pd.DataFrame, swing_today: list[dic
     lines += ["", "📝 <b>Papertrades vandaag gesloten</b>"]
     if len(done):
         for _, t in done.iterrows():
-            icon = {"winst": "✅", "verlies": "❌", "tijd": "⏱"}.get(t["status"], "•")
+            icon = {"winst": "✅", "verlies": "❌", "tijd": "⏱", "break-even": "➖"}.get(t["status"], "•")
             lines.append(f"{icon} #{int(t['id'])} <b>{esc(t['symbool'])}</b> {esc(t['setup'])}: <b>{float(t['R']):+.2f}R</b>")
         lines.append(f"Totaal vandaag: <b>{done['R'].astype(float).sum():+.2f}R</b>")
     else:
         lines.append("• geen")
     open_ = paper[paper["status"] == "open"]
     lines += ["", f"📂 <b>Papertrades nog open: {len(open_)}/3</b>"]
-    lines += [f"• #{int(t['id'])} <b>{esc(t['symbool'])}</b> {esc(t['setup'])}" for _, t in open_.iterrows()]
+    lines += [f"{'🟣' if t.get('type') == 'swing' else '⚡'} #{int(t['id'])} <b>{esc(t['symbool'])}</b> {esc(t['setup'])}"
+              for _, t in open_.iterrows()]
     prog = paper_progress(paper)
     if prog:
         lines += ["", "📈 <b>Op weg naar 30 papertrades per setup</b>"] + [f"• {esc(p)}" for p in prog]
@@ -1283,9 +1428,15 @@ def run_once(args, cfg: Config, tickers: list[str], data: dict):
     if args.swing_now or summary_due(state, cfg):
         print(f"\n{SWING} ({SWING_UITLEG}) scannen...")
         swing_new = log_swing(swing_scan(cfg, args, tickers))
+        swing_stats = (data or {}).get("swing_stats", {})
         for s in swing_new:
             print(f"  {s['symbool']}: {s['setup']} (stop {fmt_price(s['stop'])}, red zone moet boven {fmt_price(s['min_red_zone'])})")
-            telegram_send(token, chat, msg_swing(s))
+            st = swing_stats.get(f"{s['markt']}|{s['setup']}")
+            s["oordeel"] = judge_swing(st, cfg)
+            paper, pid, why = open_paper(paper, s, cfg)
+            note = (f"#{pid} geopend – de bot volgt stop en 2R-doel (max. 6 maanden)" if pid else f"niet geopend: {why}")
+            telegram_send(token, chat, msg_swing(s, st, note, cfg))
+        save_paper(paper)
         if not swing_new:
             print("  geen nieuwe swing-signalen")
         today_log = pd.read_csv(args.log) if os.path.exists(args.log) else pd.DataFrame()
